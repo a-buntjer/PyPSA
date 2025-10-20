@@ -466,7 +466,17 @@ def define_operational_constraints_for_committables(
     # state-transition constraint
     rhs = pd.DataFrame(0, sns, com_i)
     # Convert xarray boolean to list of indices for DataFrame indexing
-    initially_up_indices = com_i[initially_up.values]
+    # Handle both regular Index and MultiIndex (e.g., with scenarios)
+    if initially_up.ndim > 1:
+        # Multi-dimensional case (e.g., scenarios): filter along the last dimension
+        # initially_up has shape (scenarios, generators) or similar
+        # We need to check which generators are initially up in ANY scenario
+        initially_up_mask = initially_up.any(dim=initially_up.dims[0])
+        initially_up_indices = com_i[initially_up_mask.values]
+    else:
+        # 1-dimensional case: original behavior
+        initially_up_indices = com_i[initially_up.values]
+    
     if not initially_up_indices.empty:
         rhs.loc[sns[0], initially_up_indices] = -1
 
@@ -485,13 +495,26 @@ def define_operational_constraints_for_committables(
     )
 
     # min up time
-    min_up_time_i = com_i[min_up_time_set.astype(bool)]
+    # Handle multi-dimensional case (e.g., with scenarios)
+    if min_up_time_set.ndim > 1:
+        # Check if ANY scenario has non-zero min_up_time
+        min_up_time_mask = min_up_time_set.astype(bool).any(dim=min_up_time_set.dims[0])
+        min_up_time_i = com_i[min_up_time_mask.values]
+    else:
+        min_up_time_i = com_i[min_up_time_set.astype(bool)]
+    
     if not min_up_time_i.empty:
         expr = []
         for g in min_up_time_i:
             su = start_up.loc[:, g]
             # Retrieve the minimum up time value for generator g and convert it to a scalar
-            up_time_value = min_up_time_set.sel(name=g).item()
+            # Handle multi-dimensional case (e.g., with scenarios)
+            up_time_data = min_up_time_set.sel(name=g)
+            if up_time_data.ndim > 0:
+                # Multi-dimensional: take the maximum across scenarios to be conservative
+                up_time_value = int(up_time_data.max().item())
+            else:
+                up_time_value = up_time_data.item()
             expr.append(su.rolling(snapshot=up_time_value).sum())
         lhs_lower = -status.loc[:, min_up_time_i] + merge(expr, dim=com_i.name)
         lhs_lower = lhs_lower.sel(snapshot=sns[1:])
@@ -504,14 +527,26 @@ def define_operational_constraints_for_committables(
         )
 
     # min down time
-    min_down_time_i = com_i[min_down_time_set.astype(bool)]
+    # Handle multi-dimensional case (e.g., with scenarios)
+    if min_down_time_set.ndim > 1:
+        # Check if ANY scenario has non-zero min_down_time
+        min_down_time_mask = min_down_time_set.astype(bool).any(dim=min_down_time_set.dims[0])
+        min_down_time_i = com_i[min_down_time_mask.values]
+    else:
+        min_down_time_i = com_i[min_down_time_set.astype(bool)]
+    
     if not min_down_time_i.empty:
         expr = []
         for g in min_down_time_i:
             su = shut_down.loc[:, g]
-            down_time_value = min_down_time_set.sel(
-                {min_down_time_set.dims[0]: g}
-            ).item()
+            # Handle multi-dimensional case (e.g., with scenarios)
+            # Use 'name' dimension which works for both regular and MultiIndex
+            down_time_data = min_down_time_set.sel(name=g)
+            if down_time_data.ndim > 0:
+                # Multi-dimensional: take the maximum across scenarios to be conservative
+                down_time_value = int(down_time_data.max().item())
+            else:
+                down_time_value = down_time_data.item()
             expr.append(su.rolling(snapshot=down_time_value).sum())
         lhs_lower = status.loc[:, min_down_time_i] + merge(expr, dim=com_i.name)
         lhs_lower = lhs_lower.sel(snapshot=sns[1:])
