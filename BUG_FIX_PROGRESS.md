@@ -1,23 +1,60 @@
 # Bug Fix Progress: Committable + Stochastic in PyPSA
 
-**Updated**: After merging PyPSA v1.0.1 (October 20, 2025)
+**Updated**: ✅ **VOLLSTÄNDIG BEHOBEN** (October 20, 2025)
 
-## Problem Description
+---
 
-PyPSA has a bug when combining committable generators with stochastic scenarios. The bug causes an `IndexError` when trying to optimize networks that use both features simultaneously.
+## ✅ FINAL UPDATE: BUG ERFOLGREICH BEHOBEN!
 
-**Note**: PyPSA v1.0.1 fixed the GlobalConstraints warning issue but the committable+stochastic bug remains.
+### Lösung Implementiert
 
-## Test Results
+Der Fehler wurde durch Behandlung von Status-Variablen als **erste-Stufe-Entscheidungen** (szenariounabhängig) behoben, 
+konsistent mit Investitionsvariablen (`p_nom`, `e_nom`, `s_nom`).
 
-| Feature Combination | Status |
-|---------------------|--------|
-| Committable + Multi-investment | ✅ WORKS |
-| Stochastic + Multi-investment | ✅ WORKS |
-| **Committable + Stochastic** | ❌ FAILS |
-| Committable + Stochastic + Multi-investment | ❌ FAILS |
+### Test-Ergebnisse
 
-**Key Finding**: The bug is **NOT** specific to multi-investment periods. It occurs whenever committable and stochastic are combined, even in single-period networks.
+| Feature Combination | Status vor Fix | Status nach Fix |
+|---------------------|----------------|-----------------|
+| Committable + Multi-investment | ✅ WORKS | ✅ WORKS |
+| Stochastic + Multi-investment | ✅ WORKS | ✅ WORKS |
+| **Committable + Stochastic** | ❌ FAILS | ✅ **WORKS** |
+| Committable + Stochastic + Multi-investment | ❌ FAILS | ✅ **WORKS** |
+
+**Alle Kombinationen funktionieren jetzt!** 🎉
+
+### Implementierte Änderungen
+
+**1. `pypsa/optimization/variables.py`:**
+- Entfernt scenario-Dimension aus `com_i` Index in allen drei Funktionen
+- Status-Variablen haben jetzt Koordinaten `(snapshot, name)` statt `(scenario, snapshot, name)`
+- Aggregiert `active` mask über Szenarien (konservativ: aktiv wenn in EINEM Szenario aktiv)
+
+**2. `pypsa/optimization/constraints.py`:**
+- Aggregiert `active` mask zu Beginn
+- Aggregiert Parameter (min_up_time, min_down_time, up_time_before, down_time_before) mit `max()`
+- Vereinfacht Code durch Entfernen von MultiIndex-Spezialbehandlung
+
+### Mathematische Korrektheit
+
+Siehe `MATHEMATICAL_ANALYSIS.md` für vollständige Analyse:
+- Problem bleibt **gemischt-ganzzahlig linear (MILP)**
+- Folgt Standard zwei-stufiger stochastischer Programmierung (Takriti et al. 1996)
+- Unit Commitment vor Szenario-Realisierung (realistisch für day-ahead)
+
+### Commit
+
+```
+commit f1242a0f
+Fix committable + stochastic compatibility
+
+BREAKING CHANGE: Status variables for committable units are now first-stage decisions
+```
+
+---
+
+## Original Problem Description
+
+**Note**: PyPSA v1.0.1 fixed the GlobalConstraints warning issue but the committable+stochastic bug remained until this fix.
 
 ## Root Cause
 
