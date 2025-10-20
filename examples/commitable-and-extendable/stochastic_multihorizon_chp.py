@@ -1,15 +1,13 @@
 """Stochastic Multi-Horizon CHP Investment Planning.
 
-This example combines two advanced PyPSA v1.0 features:
+This example combines THREE advanced PyPSA v1.0 features:
 1. **Stochastic optimization**: Multiple scenarios for uncertain parameters (gas prices, demand)
 2. **Multi-investment periods**: Pathway planning across 2025, 2030, 2035, 2040
+3. **Unit commitment**: Committable components with start-up/shut-down decisions
 
 The network represents a district energy system transitioning towards lower emissions
-over multiple decades while accounting for uncertainty in fuel prices and demand growth.
-
-Note: Committable components are disabled in this example because the combination of
-committable + extendable + multi-investment + stochastic is not yet fully supported in PyPSA.
-For unit commitment examples, see `committable_extendable_chp.py`.
+over multiple decades while accounting for uncertainty in fuel prices and demand growth,
+with detailed unit commitment modeling for CHP plants and gas turbines.
 
 Scenarios:
 - **Low cost**: Moderate gas prices (50 EUR/MWh), low demand growth
@@ -334,9 +332,8 @@ def build_base_network() -> pypsa.Network:
         build_year=2025,
     )
     
-    # === CHP plant (extendable only - committable disabled for multi-investment + stochastic) ===
-    # Note: Combining committable, extendable, multi-investment AND stochastic
-    # is not fully supported yet in PyPSA. We use extendable only here.
+    # === CHP plant (extendable + committable) ===
+    # Now fully supported: committable + extendable + multi-investment + stochastic!
     
     # CHP electric output link
     n.add(
@@ -345,7 +342,7 @@ def build_base_network() -> pypsa.Network:
         bus0="bus_gas",
         bus1="bus_electric",
         efficiency=0.468,
-        committable=False,  # Disabled for multi-investment + stochastic compatibility
+        committable=True,  # Now enabled with the bug fix!
         capital_cost=480,
         p_nom_extendable=True,
         p_min_pu=0.35,  # Minimum part load
@@ -362,7 +359,7 @@ def build_base_network() -> pypsa.Network:
         bus1="bus_heat",
         carrier="heat",
         efficiency=1.0,  # Will be adjusted for iso-fuel constraint
-        committable=False,  # Disabled for multi-investment + stochastic compatibility
+        committable=True,  # Now enabled with the bug fix!
         capital_cost=350,
         p_nom_extendable=True,
         p_min_pu=0.20,  # Minimum part load
@@ -393,7 +390,7 @@ def build_base_network() -> pypsa.Network:
         build_year=2030,
     )
     
-    # Peak gas turbine (extendable only - committable disabled for compatibility)
+    # Peak gas turbine (now with committable enabled!)
     n.add(
         "Generator",
         "gas_peaker",
@@ -401,7 +398,7 @@ def build_base_network() -> pypsa.Network:
         carrier="gas",
         p_nom_extendable=True,
         marginal_cost=140,
-        committable=False,  # Disabled for multi-investment + stochastic compatibility
+        committable=True,  # Now enabled with the bug fix!
         p_min_pu=0.0,
         capital_cost=420,
         lifetime=30,
@@ -548,7 +545,7 @@ def add_chp_coupling_constraints(n: pypsa.Network) -> None:
     
     link_p = model.variables["Link-p"]
     link_p_nom = model.variables["Link-p_nom"]
-    # Note: Link-status not available when committable=False
+    link_status = model.variables["Link-status"]  # Now available with committable=True!
     
     # After set_scenarios(), link names become MultiIndex (scenario, name)
     # We need to get efficiency from any scenario (they're all the same)
@@ -592,7 +589,14 @@ def add_chp_coupling_constraints(n: pypsa.Network) -> None:
         name="chp-top-iso-fuel-line",
     )
     
-    # Note: Commitment synchronization not needed when committable=False
+    # Commitment synchronization: both sides must have same status
+    generator_status = link_status.sel(name="chp_generator")
+    boiler_status = link_status.sel(name="chp_boiler")
+    
+    model.add_constraints(
+        generator_status - boiler_status == 0,
+        name="chp-synchronized-commitment",
+    )
     
     # Solve the model
     n.optimize.solve_model(
