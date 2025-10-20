@@ -1,8 +1,12 @@
 # Bug Fix Progress: Committable + Stochastic in PyPSA
 
+**Updated**: After merging PyPSA v1.0.1 (October 20, 2025)
+
 ## Problem Description
 
 PyPSA has a bug when combining committable generators with stochastic scenarios. The bug causes an `IndexError` when trying to optimize networks that use both features simultaneously.
+
+**Note**: PyPSA v1.0.1 fixed the GlobalConstraints warning issue but the committable+stochastic bug remains.
 
 ## Test Results
 
