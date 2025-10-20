@@ -1,0 +1,82 @@
+def add_chp_coupling_constraints(n: pypsa.Network) -> None:
+    """Add CHP coupling constraints to the PyPSA optimisation model."""
+
+    model = n.optimize.create_model()
+
+    link_p = model.variables["Link-p"]
+    link_p_nom = model.variables["Link-p_nom"]
+    link_status = (
+        model.variables["Link-status"]
+        if "Link-status" in model.variables
+        else None
+    )
+
+    generator_eff = float(n.links.at["chp_generator", "efficiency"])
+    boiler_eff = float(n.links.at["chp_boiler", "efficiency"])
+
+    # VEREINFACHTES MODELL: Nur zwei Links (kein chp_fuel mehr)
+    # Generator und Boiler sind direkt an bus_gas angeschlossen
+    generator_p = link_p.sel(
+        name="chp_generator"
+    )  # Brennstoff-Input für Strom
+    boiler_p = link_p.sel(name="chp_boiler")  # Brennstoff-Input für Wärme
+    generator_p_nom = link_p_nom.sel(name="chp_generator")
+    boiler_p_nom = link_p_nom.sel(name="chp_boiler")
+
+    electric_output = generator_eff * generator_p
+    heat_output = boiler_eff * boiler_p
+
+    # Nominal power proportionality using output capacities.
+
+    model.add_constraints(
+        generator_eff * BCHP_QP_RATIO * generator_p_nom
+        - boiler_eff * boiler_p_nom
+        == 0,
+        name="chp-heat-capacity-proportionality",
+    )
+
+    # ---------------------------
+    # BHKW: (fast) starre P/Q-Kopplung
+    # ---------------------------
+    RHO = float(BCHP_QP_RATIO)
+    RHO_LOW = RHO * (1.0 - BCHP_COUPLING_BAND)
+    RHO_HIGH = RHO * (1.0 + BCHP_COUPLING_BAND)
+
+    # # elektrische Nenn-OUTPUT-Kapazität (als Referenz, linear in Variablen):
+    electric_output_nom = generator_eff * generator_p_nom  # [MW_el,nom]
+
+    # # Untere Bandgrenze: Q >= RHO_LOW * P  (fast „starr“ nach unten)
+    model.add_constraints(
+        heat_output - RHO_LOW * electric_output >= 0,
+        name="bhkw-lower-coupling",
+    )
+
+    # # Obere Bandgrenze: Q <= RHO_HIGH * P + BIAS * (P_nom - P)
+    # # -> In Teillast (P < P_nom) ist „etwas mehr Wärme“ erlaubt.
+    model.add_constraints(
+        heat_output
+        - RHO_HIGH * electric_output
+        - BCHP_THERMAL_BIAS * (electric_output_nom - electric_output)
+        <= 0,
+        name="bhkw-upper-coupling",
+    )
+
+    # FIX: Status-Synchronisation ENTFERNT
+    # Da chp_boiler jetzt nicht mehr committable ist (committable=False),
+    # gibt es keine status-Variable für chp_boiler mehr.
+    # Die Status-Synchronisation war das Hauptproblem: Sie erzwang gleiche on/off states,
+    # aber mit unterschiedlichen p_min_pu Werten (Generator 40%, Boiler 10%) entstand
+    # eine mathematische Übereinschränkung.
+    # if link_status is not None:
+    #     # Synchronise commitment state of CHP links (nur wenn beide committable sind).
+    #     if "chp_boiler" in link_status.coords["name"].values:
+    #         model.add_constraints(
+    #             link_status.loc[:, "chp_generator"]
+    #             - link_status.loc[:, "chp_boiler"]
+    #             == 0,
+    #             name="chp-status-synchronisation",
+    #         )
+
+    n.optimize.solve_model(
+        solver_options={"mip_rel_gap": 0.8, "threads": 16, "parallel": "on"}
+    )

@@ -1,7 +1,3 @@
-# SPDX-FileCopyrightText: PyPSA Contributors
-#
-# SPDX-License-Identifier: MIT
-
 """Define optimisation constraints from PyPSA networks with Linopy."""
 
 from __future__ import annotations
@@ -118,9 +114,9 @@ def define_operational_constraints_for_non_extendables(
 
     References
     ----------
-    [1] F. Neumann, T. Brown, "Transmission losses in power system
-        optimization models: A comparison of heuristic and exact solution methods,"
-        Applied Energy, 2022, https://doi.org/10.1016/j.apenergy.2022.118859
+    .. [1] F. Neumann, T. Brown, "Transmission losses in power system
+       optimization models: A comparison of heuristic and exact solution methods,"
+       Applied Energy, 2022, https://doi.org/10.1016/j.apenergy.2022.118859
 
     """
     c = as_components(n, component)
@@ -298,10 +294,10 @@ def define_operational_constraints_for_committables(
 
     References
     ----------
-    [2] Y. Hua, C. Liu, J. Zhang, "Representing Operational
-        Flexibility in Generation Expansion Planning Through Convex Relaxation
-        of Unit Commitment," IEEE Transactions on Power Systems, vol. 32,
-        no. 5, pp. 3854-3865, 2017, https://doi.org/10.1109/TPWRS.2017.2735026
+    .. [2] Y. Hua, C. Liu, J. Zhang, "Representing Operational
+       Flexibility in Generation Expansion Planning Through Convex Relaxation
+       of Unit Commitment," IEEE Transactions on Power Systems, vol. 32,
+       no. 5, pp. 3854-3865, 2017, https://doi.org/10.1109/TPWRS.2017.2735026
 
     """
     c = as_components(n, component)
@@ -316,11 +312,6 @@ def define_operational_constraints_for_committables(
     status_diff = status - status.shift(snapshot=1)
     p = n.model[f"{c.name}-p"].sel(name=com_i)
     active = c.da.active.sel(name=com_i, snapshot=sns)
-    
-    # Status, start_up, shut_down are now first-stage variables (no scenario dimension)
-    # If active has scenario dimension, aggregate it (unit is active if active in ANY scenario)
-    if "scenario" in active.dims:
-        active = active.any(dim="scenario")
 
     ext_i: pd.Index = c.extendables.difference(c.inactive_assets)
     com_ext_i: pd.Index = com_i.intersection(ext_i)
@@ -336,12 +327,6 @@ def define_operational_constraints_for_committables(
     upper_p = max_pu * nominal
     min_up_time_set = c.da.min_up_time.sel(name=com_i)
     min_down_time_set = c.da.min_down_time.sel(name=com_i)
-    
-    # Aggregate scenario-dependent parameters (use max for conservative approach)
-    if "scenario" in min_up_time_set.dims:
-        min_up_time_set = min_up_time_set.max(dim="scenario")
-    if "scenario" in min_down_time_set.dims:
-        min_down_time_set = min_down_time_set.max(dim="scenario")
 
     ramp_up_limit = nominal * c.da.ramp_limit_up.sel(name=com_i).fillna(1)
     ramp_down_limit = nominal * c.da.ramp_limit_down.sel(name=com_i).fillna(1)
@@ -349,13 +334,6 @@ def define_operational_constraints_for_committables(
     ramp_shut_down = nominal * c.da.ramp_limit_shut_down.sel(name=com_i)
     up_time_before_set = c.da.up_time_before.sel(name=com_i)
     down_time_before_set = c.da.down_time_before.sel(name=com_i)
-    
-    # Aggregate scenario-dependent parameters
-    if "scenario" in up_time_before_set.dims:
-        up_time_before_set = up_time_before_set.max(dim="scenario")
-    if "scenario" in down_time_before_set.dims:
-        down_time_before_set = down_time_before_set.max(dim="scenario")
-    
     initially_up = up_time_before_set.astype(bool)
     initially_down = down_time_before_set.astype(bool)
 
@@ -483,14 +461,8 @@ def define_operational_constraints_for_committables(
 
     # state-transition constraint
     rhs = pd.DataFrame(0, sns, com_i)
-    # Status variables no longer have scenario dimension (first-stage decision)
-    # If initially_up has scenarios, aggregate across them (conservative: up if up in ANY scenario)
-    if "scenario" in initially_up.dims:
-        initially_up_agg = initially_up.any(dim="scenario")
-    else:
-        initially_up_agg = initially_up
-    initially_up_indices = com_i[initially_up_agg.values]
-    
+    # Convert xarray boolean to list of indices for DataFrame indexing
+    initially_up_indices = com_i[initially_up.values]
     if not initially_up_indices.empty:
         rhs.loc[sns[0], initially_up_indices] = -1
 
@@ -509,15 +481,13 @@ def define_operational_constraints_for_committables(
     )
 
     # min up time
-    # Status variables no longer have scenario dimension
     min_up_time_i = com_i[min_up_time_set.astype(bool)]
-    
     if not min_up_time_i.empty:
         expr = []
         for g in min_up_time_i:
             su = start_up.loc[:, g]
-            # Get the minimum up time value for generator g
-            up_time_value = int(min_up_time_set.sel(name=g).item())
+            # Retrieve the minimum up time value for generator g and convert it to a scalar
+            up_time_value = min_up_time_set.sel(name=g).item()
             expr.append(su.rolling(snapshot=up_time_value).sum())
         lhs_lower = -status.loc[:, min_up_time_i] + merge(expr, dim=com_i.name)
         lhs_lower = lhs_lower.sel(snapshot=sns[1:])
@@ -530,15 +500,14 @@ def define_operational_constraints_for_committables(
         )
 
     # min down time
-    # Status variables no longer have scenario dimension
     min_down_time_i = com_i[min_down_time_set.astype(bool)]
-    
     if not min_down_time_i.empty:
         expr = []
         for g in min_down_time_i:
             su = shut_down.loc[:, g]
-            # Get the minimum down time value for generator g
-            down_time_value = int(min_down_time_set.sel(name=g).item())
+            down_time_value = min_down_time_set.sel(
+                {min_down_time_set.dims[0]: g}
+            ).item()
             expr.append(su.rolling(snapshot=down_time_value).sum())
         lhs_lower = status.loc[:, min_down_time_i] + merge(expr, dim=com_i.name)
         lhs_lower = lhs_lower.sel(snapshot=sns[1:])
@@ -1204,9 +1173,9 @@ def define_kirchhoff_voltage_constraints(n: Network, sns: pd.Index) -> None:
 
     References
     ----------
-    [3] J. Hörsch et al., "Linear optimal power flow using cycle flows,"
-        Electric Power Systems Research, vol. 158, pp. 126-135, 2018,
-        https://doi.org/10.1016/j.epsr.2020.106908
+    .. [3] J. Hörsch et al., "Linear optimal power flow using cycle flows,"
+       Electric Power Systems Research, vol. 158, pp. 126-135, 2018,
+       https://doi.org/10.1016/j.epsr.2020.106908
 
     """
     m = n.model
@@ -1269,13 +1238,11 @@ def define_fixed_nominal_constraints(n: Network, component: str, attr: str) -> N
     if attr + "_set" not in c.static:
         return
 
-    fix = c.static[attr + "_set"].dropna()
+    dim = f"{component}-{attr}_set_i"
+    fix = c.static[attr + "_set"].dropna().rename_axis(dim)
 
     if fix.empty:
         return
-
-    dim = f"{component}-{attr}_set_i"
-    fix = fix.rename_axis(dim)
 
     var = n.model[f"{component}-{attr}"]
     var = reindex(var, var.dims[0], fix.index)
@@ -1441,17 +1408,6 @@ def define_storage_unit_constraints(n: Network, sns: pd.Index) -> None:
     For multi-investment period models, the function supports both cycling
     within each period and carrying state of charge between periods.
 
-    Three key flags control the behavior:
-
-    - **C** (cyclic_state_of_charge): If True, globally cycle state of charge
-      from the last snapshot back to the first snapshot across all periods.
-    - **CP** (cyclic_state_of_charge_per_period): If True, cycle state of charge
-      within each investment period (last snapshot of period wraps to first).
-    - **IP** (state_of_charge_initial_per_period): If True, reset to initial
-      state_of_charge_initial value at the start of each period.
-
-    When CP=True and IP=True simultaneously, CP takes precedence (wrapping behavior).
-
     Standing losses are applied based on the elapsed hours between snapshots.
 
     """
@@ -1505,13 +1461,10 @@ def define_storage_unit_constraints(n: Network, sns: pd.Index) -> None:
     soc_init = c.da.state_of_charge_initial
     rhs = -c.da.inflow.sel(snapshot=sns) * eh
 
-    if n._multi_invest:
+    if isinstance(sns, pd.MultiIndex):
         # If multi-horizon optimizing, we update the previous_soc and the rhs
         # for all assets which are cyclic/non-cyclic per period
         periods = soc.coords["period"]
-        # An asset is treated as per-period if:
-        # 1. It cycles per period (CP=cyclic_state_of_charge_per_period=True), OR
-        # 2. It uses initial state per period (IP=state_of_charge_initial_per_period=True)
         per_period = (
             c.da.cyclic_state_of_charge_per_period
             | c.da.state_of_charge_initial_per_period
@@ -1527,17 +1480,10 @@ def define_storage_unit_constraints(n: Network, sns: pd.Index) -> None:
         ]
         previous_soc_pp = concat(previous_soc_pp_list, dim="snapshot")
 
-        # We create a mask `include_previous_soc_pp` which determines when to include
-        # previous state of charge from within the period:
-        # - Always include previous for snapshots within a period (periods == periods.shift())
-        # - At period boundaries (first snapshot):
-        #   * If CP=True AND IP=False: cycle to last snapshot of period (wrap)
-        #   * If IP=True: use initial value instead (no wrap, handled via rhs)
-        #   * If CP=True AND IP=True: CP takes precedence, wrap (IP ignored)
-        include_previous_soc_pp = active & (
-            (periods == periods.shift(snapshot=1))
-            | c.da.cyclic_state_of_charge_per_period
-        )
+        # We create a mask `include_previous_soc_pp` which excludes the first
+        # snapshot of each period for non-cyclic assets
+        include_previous_soc_pp = (periods == periods.shift(snapshot=1)) & active
+        include_previous_soc_pp = include_previous_soc_pp.where(noncyclic_b, True)
 
         # Ensure that dimension order is consistent for stochastic networks
         if n.has_scenarios:
@@ -1555,42 +1501,6 @@ def define_storage_unit_constraints(n: Network, sns: pd.Index) -> None:
         include_previous_soc = include_previous_soc_pp.where(
             per_period, include_previous_soc
         )
-
-    # Warn if cyclic overrides initial values (both global and per-period)
-    has_initial = c.da.state_of_charge_initial != 0
-    global_conflict = c.da.cyclic_state_of_charge & has_initial
-    period_conflict = (
-        (
-            c.da.cyclic_state_of_charge_per_period
-            & c.da.state_of_charge_initial_per_period
-            & has_initial
-        )
-        if n._multi_invest
-        else False
-    )
-
-    ignored = global_conflict | period_conflict
-    if ignored.any():
-        affected = c.static.index[ignored.values].tolist()
-        logger.warning(
-            "StorageUnits %s: Cyclic state of charge constraint overrules initial storage level setting. "
-            "User-defined state_of_charge_initial will be ignored.",
-            affected,
-        )
-
-    # Warn if per-period cyclic overrides global cyclic
-    if n._multi_invest:
-        cp_overrides_c = (
-            c.da.cyclic_state_of_charge & c.da.cyclic_state_of_charge_per_period
-        )
-        if cp_overrides_c.any():
-            affected = c.static.index[cp_overrides_c.values].tolist()
-            logger.warning(
-                "StorageUnits %s: Per-period cyclic (cyclic_state_of_charge_per_period=True) "
-                "overrides global cyclic (cyclic_state_of_charge=True). "
-                "Storage will cycle within each investment period, not across the entire horizon.",
-                affected,
-            )
 
     lhs += [(eff_stand, previous_soc)]
 
@@ -1642,17 +1552,6 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
     For multi-investment period models, the function supports both cycling
     within each period and carrying energy between periods.
 
-    Three key flags control the behavior:
-
-    - **C** (e_cyclic): If True, globally cycle energy level
-      from the last snapshot back to the first snapshot across all periods.
-    - **CP** (e_cyclic_per_period): If True, cycle energy level
-      within each investment period (last snapshot of period wraps to first).
-    - **IP** (e_initial_per_period): If True, reset to initial
-      e_initial value at the start of each period.
-
-    When CP=True and IP=True simultaneously, CP takes precedence (wrapping behavior).
-
     Standing losses are applied based on the elapsed hours between snapshots.
 
     """
@@ -1696,15 +1595,13 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
     e_init = c.da.e_initial.sel(name=c.active_assets)
     rhs = DataArray(0)
 
-    if n._multi_invest:
+    if isinstance(sns, pd.MultiIndex):
         # If multi-horizon optimization, we update previous_e and the rhs
         # for all assets which are cyclic/non-cyclic per period
         periods = e.coords["period"]
-        # An asset is treated as per-period if:
-        # 1. It cycles per period (CP=e_cyclic_per_period=True), OR
-        # 2. It uses initial energy per period (IP=e_initial_per_period=True)
-        per_period = c.da.e_cyclic_per_period | c.da.e_initial_per_period
-        per_period = per_period.sel(name=c.active_assets)
+        per_period = c.da.e_cyclic_per_period.sel(
+            name=c.active_assets
+        ) | c.da.e_initial_per_period.sel(name=c.active_assets)
 
         # We calculate the previous e per period while cycling within a period
         # Normally, we should use groupby, but it's broken for multi-index
@@ -1714,16 +1611,10 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
         previous_e_pp_list = [e.data.sel(snapshot=(p, sl)).roll(snapshot=1) for p in ps]
         previous_e_pp = concat(previous_e_pp_list, dim="snapshot")
 
-        # We create a mask `include_previous_e_pp` which determines when to include
-        # previous energy from within the period:
-        # - Always include previous for snapshots within a period (periods == periods.shift())
-        # - At period boundaries (first snapshot):
-        #   * If CP=True AND IP=False: cycle to last snapshot of period (wrap)
-        #   * If IP=True: use initial value instead (no wrap, handled via rhs)
-        #   * If CP=True AND IP=True: CP takes precedence, wrap (IP ignored)
-        include_previous_e_pp = active & (
-            (periods == periods.shift(snapshot=1)) | c.da.e_cyclic_per_period
-        )
+        # We create a mask `include_previous_e_pp` which excludes the first
+        # snapshot of each period for non-cyclic assets
+        include_previous_e_pp = active & (periods == periods.shift(snapshot=1))
+        include_previous_e_pp = include_previous_e_pp.where(noncyclic_b, True)
 
         # We take values still to handle internal xarray multi-index difficulties
         previous_e_pp = previous_e_pp.where(
@@ -1733,40 +1624,6 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
         # update previous_e variables and rhs
         previous_e = previous_e.where(~per_period, previous_e_pp)
         include_previous_e = include_previous_e_pp.where(per_period, include_previous_e)
-
-    # Warn if cyclic overrides initial values (both global and per-period)
-    has_initial = c.da.e_initial != 0
-    global_conflict = c.da.e_cyclic.sel(name=c.active_assets) & has_initial
-    period_conflict = (
-        (c.da.e_cyclic_per_period & c.da.e_initial_per_period & has_initial).sel(
-            name=c.active_assets
-        )
-        if n._multi_invest
-        else False
-    )
-
-    ignored = global_conflict | period_conflict
-    if ignored.any():
-        affected = c.static.index[ignored.values].tolist()
-        logger.warning(
-            "Stores %s: Cyclic energy level constraint overrules initial value setting. "
-            "User-defined e_initial will be ignored.",
-            affected,
-        )
-
-    # Warn if per-period cyclic overrides global cyclic
-    if n._multi_invest:
-        cp_overrides_c = (
-            c.da.e_cyclic.sel(name=c.active_assets) & c.da.e_cyclic_per_period
-        )
-        if cp_overrides_c.any():
-            affected = c.static.index[cp_overrides_c.values].tolist()
-            logger.warning(
-                "Stores %s: Per-period cyclic (e_cyclic_per_period=True) "
-                "overrides global cyclic (e_cyclic=True). "
-                "Storage will cycle within each investment period, not across the entire horizon.",
-                affected,
-            )
 
     # Add the previous energy term with standing efficiency factor
     lhs += [(eff_stand, previous_e)]
@@ -1815,9 +1672,9 @@ def define_loss_constraints(
 
     References
     ----------
-    [1] F. Neumann, T. Brown, "Transmission losses in power system
-        optimization models: A comparison of heuristic and exact solution methods,"
-        Applied Energy, 2022, https://doi.org/10.1016/j.apenergy.2022.118859
+    .. [1] F. Neumann, T. Brown, "Transmission losses in power system
+       optimization models: A comparison of heuristic and exact solution methods,"
+       Applied Energy, 2022, https://doi.org/10.1016/j.apenergy.2022.118859
 
     """
     c = as_components(n, component)

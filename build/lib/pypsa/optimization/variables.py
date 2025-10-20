@@ -1,7 +1,3 @@
-# SPDX-FileCopyrightText: PyPSA Contributors
-#
-# SPDX-License-Identifier: MIT
-
 """Define optimisation variables from PyPSA networks with Linopy."""
 
 from __future__ import annotations
@@ -69,21 +65,8 @@ def define_status_variables(
     if com_i.empty:
         return
 
-    # Remove scenario dimension from committables index (status is first-stage decision)
-    # This ensures consistency with investment variables (p_nom, e_nom, s_nom)
-    # which are also scenario-independent first-stage decisions
-    if isinstance(com_i, pd.MultiIndex):
-        com_i = com_i.unique(level="name")
-
-    # Build coordinates explicitly without scenario dimension
-    coords = [sns, com_i]
-    
-    # Get active mask (Linopy will handle broadcasting if active has scenario dimension)
     active = c.da.active.sel(name=com_i, snapshot=sns)
-    if "scenario" in active.dims:
-        # Unit is active if active in ANY scenario (conservative approach)
-        active = active.any(dim="scenario")
-    
+    coords = active.coords
     is_binary = not is_linearized
     kwargs = {"upper": 1, "lower": 0} if not is_binary else {}
     n.model.add_variables(
@@ -114,18 +97,8 @@ def define_start_up_variables(
     if com_i.empty:
         return
 
-    # Remove scenario dimension (start_up is first-stage decision, like status)
-    if isinstance(com_i, pd.MultiIndex):
-        com_i = com_i.unique(level="name")
-
-    # Build coordinates explicitly without scenario dimension
-    coords = [sns, com_i]
-    
-    # Get active mask with scenario handling
     active = c.da.active.sel(name=com_i, snapshot=sns)
-    if "scenario" in active.dims:
-        active = active.any(dim="scenario")
-    
+    coords = active.coords
     is_binary = not is_linearized
     kwargs = {"upper": 1, "lower": 0} if not is_binary else {}
     n.model.add_variables(
@@ -160,18 +133,8 @@ def define_shut_down_variables(
     if com_i.empty:
         return
 
-    # Remove scenario dimension (shut_down is first-stage decision, like status)
-    if isinstance(com_i, pd.MultiIndex):
-        com_i = com_i.unique(level="name")
-
-    # Build coordinates explicitly without scenario dimension
-    coords = [sns, com_i]
-    
-    # Get active mask with scenario handling
     active = c.da.active.sel(name=com_i, snapshot=sns)
-    if "scenario" in active.dims:
-        active = active.any(dim="scenario")
-    
+    coords = active.coords
     is_binary = not is_linearized
     kwargs = {"upper": 1, "lower": 0} if not is_binary else {}
     n.model.add_variables(
@@ -279,10 +242,10 @@ def define_cvar_variables(n: Network) -> None:
     This helper adds three auxiliary variables to the model when
     stochastic optimisation with risk preference is enabled.
 
-    * `CVaR-a` (per-scenario, non-negative): auxiliary excess loss variables `a_s`.
-      They linearise the tail expectation: `a_s >= OPEX_s - theta`.
-    * `CVaR-theta` (scalar): the Value-at-Risk (VaR) level `theta` at confidence `alpha`.
-    * `CVaR` (scalar): the Conditional Value-at-Risk (Expected Shortfall) objective term.
+    * ``CVaR-a`` (per-scenario, non-negative): auxiliary excess loss variables ``a_s``.
+      They linearise the tail expectation: ``a_s >= OPEX_s - theta``.
+    * ``CVaR-theta`` (scalar): the Value-at-Risk (VaR) level ``theta`` at confidence ``alpha``.
+    * ``CVaR`` (scalar): the Conditional Value-at-Risk (Expected Shortfall) objective term.
 
     These variables are linked by constraints (added in the objective construction)
     to implement the linear CVaR formulation.
