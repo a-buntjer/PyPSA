@@ -305,57 +305,83 @@ def define_operational_constraints_for_committables(
 
     """
     c = as_components(n, component)
-    com_i: pd.Index = c.committables.difference(c.inactive_assets)
+    com_i_base: pd.Index = c.committables.difference(c.inactive_assets)
 
-    if com_i.empty:
+    if com_i_base.empty:
         return
 
     status = n.model[f"{c.name}-status"]
     start_up = n.model[f"{c.name}-start_up"]
     shut_down = n.model[f"{c.name}-shut_down"]
-    status_diff = status - status.shift(snapshot=1)
-    p = n.model[f"{c.name}-p"].sel(name=com_i)
-    active = c.da.active.sel(name=com_i, snapshot=sns)
     
-    # Status, start_up, shut_down are now first-stage variables (no scenario dimension)
-    # If active has scenario dimension, aggregate it (unit is active if active in ANY scenario)
-    if "scenario" in active.dims:
-        active = active.any(dim="scenario")
+    # Get actual index from status variable (may include scenarios in MultiIndex)
+    # If status has both 'scenario' and 'name' dimensions, create MultiIndex
+    has_scenarios = "scenario" in status.dims and "name" in status.dims
+    
+    if has_scenarios:
+        # Create MultiIndex from (scenario, name) combinations
+        scenarios = status.coords["scenario"].values
+        names = status.coords["name"].values
+        import itertools
+        com_i = pd.MultiIndex.from_tuples(
+            list(itertools.product(scenarios, names)),
+            names=["scenario", c.name]  # Use component name to avoid conflict with 'name' dimension
+        )
+        # Extract just the names for data selection (data is already scenario-aware)
+        # Use level index 1 (second level) instead of name to avoid issues
+        names_only = com_i.get_level_values(1).unique()
+    else:
+        # No scenarios, use simple index
+        com_i = com_i_base
+        names_only = com_i
+    
+    status_diff = status - status.shift(snapshot=1)
+    p = n.model[f"{c.name}-p"].sel(name=names_only)
+    active = c.da.active.sel(name=names_only, snapshot=sns)
 
     ext_i: pd.Index = c.extendables.difference(c.inactive_assets)
-    com_ext_i: pd.Index = com_i.intersection(ext_i)
-    com_fix_i: pd.Index = com_i.difference(ext_i)
+    
+    # Create scenario-aware extendable/fixed indices if we have scenarios
+    if has_scenarios:
+        # For each scenario, find which names are extendable/fixed
+        scenarios = com_i.get_level_values(0).unique()  # Level 0 is scenario
+        names = com_i.get_level_values(1).unique()  # Level 1 is component name
+        
+        # Create MultiIndex for extendables: (scenario, name) where name in ext_i
+        ext_names_in_com = [name for name in names if name in ext_i]
+        com_ext_i = pd.MultiIndex.from_product(
+            [scenarios, ext_names_in_com],
+            names=["scenario", c.name]  # Use component name
+        )
+        
+        # Create MultiIndex for fixed: (scenario, name) where name not in ext_i
+        fix_names_in_com = [name for name in names if name not in ext_i]
+        com_fix_i = pd.MultiIndex.from_product(
+            [scenarios, fix_names_in_com],
+            names=["scenario", c.name]  # Use component name
+        )
+    else:
+        # Original logic without scenarios
+        com_ext_i: pd.Index = com_i.intersection(ext_i)
+        com_fix_i: pd.Index = com_i.difference(ext_i)
 
     # parameters
-    nominal = c.da[c._operational_attrs["nom"]].sel(name=com_i)
+    nominal = c.da[c._operational_attrs["nom"]].sel(name=names_only)
     min_pu, max_pu = c.get_bounds_pu(attr="p")
-    min_pu = min_pu.sel(name=com_i, snapshot=sns)
-    max_pu = max_pu.sel(name=com_i, snapshot=sns)
+    min_pu = min_pu.sel(name=names_only, snapshot=sns)
+    max_pu = max_pu.sel(name=names_only, snapshot=sns)
 
     lower_p = min_pu * nominal
     upper_p = max_pu * nominal
-    min_up_time_set = c.da.min_up_time.sel(name=com_i)
-    min_down_time_set = c.da.min_down_time.sel(name=com_i)
-    
-    # Aggregate scenario-dependent parameters (use max for conservative approach)
-    if "scenario" in min_up_time_set.dims:
-        min_up_time_set = min_up_time_set.max(dim="scenario")
-    if "scenario" in min_down_time_set.dims:
-        min_down_time_set = min_down_time_set.max(dim="scenario")
+    min_up_time_set = c.da.min_up_time.sel(name=names_only)
+    min_down_time_set = c.da.min_down_time.sel(name=names_only)
 
-    ramp_up_limit = nominal * c.da.ramp_limit_up.sel(name=com_i).fillna(1)
-    ramp_down_limit = nominal * c.da.ramp_limit_down.sel(name=com_i).fillna(1)
-    ramp_start_up = nominal * c.da.ramp_limit_start_up.sel(name=com_i)
-    ramp_shut_down = nominal * c.da.ramp_limit_shut_down.sel(name=com_i)
-    up_time_before_set = c.da.up_time_before.sel(name=com_i)
-    down_time_before_set = c.da.down_time_before.sel(name=com_i)
-    
-    # Aggregate scenario-dependent parameters
-    if "scenario" in up_time_before_set.dims:
-        up_time_before_set = up_time_before_set.max(dim="scenario")
-    if "scenario" in down_time_before_set.dims:
-        down_time_before_set = down_time_before_set.max(dim="scenario")
-    
+    ramp_up_limit = nominal * c.da.ramp_limit_up.sel(name=names_only).fillna(1)
+    ramp_down_limit = nominal * c.da.ramp_limit_down.sel(name=names_only).fillna(1)
+    ramp_start_up = nominal * c.da.ramp_limit_start_up.sel(name=names_only)
+    ramp_shut_down = nominal * c.da.ramp_limit_shut_down.sel(name=names_only)
+    up_time_before_set = c.da.up_time_before.sel(name=names_only)
+    down_time_before_set = c.da.down_time_before.sel(name=names_only)
     initially_up = up_time_before_set.astype(bool)
     initially_down = down_time_before_set.astype(bool)
 
@@ -383,9 +409,12 @@ def define_operational_constraints_for_committables(
 
     if not com_ext_i.empty:
         p_nom_var = n.model[f"{c.name}-{c._operational_attrs['nom']}"]
+        
+        # Extract names for data selection (level 1 is the component names)
+        ext_names_only = com_ext_i.get_level_values(1).unique() if has_scenarios else com_ext_i
 
-        p_nom_max_vals = c.da.p_nom_max.sel(name=com_ext_i)
-        max_pu_vals = max_pu.sel(name=com_ext_i).max("snapshot")
+        p_nom_max_vals = c.da.p_nom_max.sel(name=ext_names_only)
+        max_pu_vals = max_pu.sel(name=ext_names_only).max("snapshot")
 
         big_m_default = options.params.optimize.committable_big_m
         if (
@@ -401,13 +430,14 @@ def define_operational_constraints_for_committables(
             p_nom_max_vals * max_pu_vals,
             fallback_values,
         )
-        p_ext = p.sel(name=com_ext_i)
-        status_ext = status.sel(name=com_ext_i)
-        p_nom_ext = p_nom_var.sel(name=com_ext_i)
-        min_pu_ext = min_pu.sel(name=com_ext_i)
-        max_pu_ext = max_pu.sel(name=com_ext_i)
+        # Select with names_only - variables already have scenario dimension if present
+        p_ext = p.sel(name=ext_names_only)
+        status_ext = status.sel(name=ext_names_only)
+        p_nom_ext = p_nom_var.sel(name=ext_names_only)
+        min_pu_ext = min_pu.sel(name=ext_names_only)
+        max_pu_ext = max_pu.sel(name=ext_names_only)
 
-        active_ext = active.sel(name=com_ext_i)
+        active_ext = active.sel(name=ext_names_only)
         lhs_lower = (1, p_ext), (-min_pu_ext, p_nom_ext), (-M_values, status_ext)
         n.model.add_constraints(
             lhs_lower,
@@ -457,11 +487,14 @@ def define_operational_constraints_for_committables(
                 )
 
     if not com_fix_i.empty:
-        p_fix = p.sel(name=com_fix_i)
-        status_fix = status.sel(name=com_fix_i)
-        lower_p_fix = lower_p.sel(name=com_fix_i)
-        upper_p_fix = upper_p.sel(name=com_fix_i)
-        active_fix = active.sel(name=com_fix_i)
+        # Extract names for data selection (level 1 is the component names)
+        fix_names_only = com_fix_i.get_level_values(1).unique() if has_scenarios else com_fix_i
+        
+        p_fix = p.sel(name=fix_names_only)
+        status_fix = status.sel(name=fix_names_only)
+        lower_p_fix = lower_p.sel(name=fix_names_only)
+        upper_p_fix = upper_p.sel(name=fix_names_only)
+        active_fix = active.sel(name=fix_names_only)
 
         lhs_lower_fix = (1, p_fix), (-lower_p_fix, status_fix)
         n.model.add_constraints(
@@ -482,26 +515,53 @@ def define_operational_constraints_for_committables(
         )
 
     # state-transition constraint
-    rhs = pd.DataFrame(0, sns, com_i)
-    # Status variables no longer have scenario dimension (first-stage decision)
-    # If initially_up has scenarios, aggregate across them (conservative: up if up in ANY scenario)
-    if "scenario" in initially_up.dims:
-        initially_up_agg = initially_up.any(dim="scenario")
-    else:
-        initially_up_agg = initially_up
-    initially_up_indices = com_i[initially_up_agg.values]
+    # Check if we have scenarios
+    has_scenarios_check = isinstance(com_i, pd.MultiIndex) and c.name in com_i.names
     
-    if not initially_up_indices.empty:
-        rhs.loc[sns[0], initially_up_indices] = -1
+    if has_scenarios_check:
+        # Create RHS as xarray with same shape as status
+        scenarios = com_i.get_level_values(0).unique()
+        names = com_i.get_level_values(1).unique()
+        rhs = DataArray(
+            0.0,
+            coords=[("snapshot", sns), ("scenario", scenarios), ("name", names)],
+            dims=["snapshot", "scenario", "name"]
+        )
+        # Set initial conditions for components that are initially up
+        for scenario, name in com_i:
+            if initially_up.sel(scenario=scenario, name=name).item():
+                rhs.loc[{"snapshot": sns[0], "scenario": scenario, "name": name}] = -1
+    else:
+        # Original logic for non-scenario case
+        rhs = pd.DataFrame(0, sns, com_i)
+        initially_up_indices = com_i[initially_up.values]
+        if not initially_up_indices.empty:
+            rhs.loc[sns[0], initially_up_indices] = -1
 
     lhs_lower = start_up - status_diff
     n.model.add_constraints(
         lhs_lower, ">=", rhs, name=f"{c.name}-com-transition-start-up", mask=active
     )
 
-    rhs = pd.DataFrame(0, sns, com_i)
-    if not initially_up_indices.empty:
-        rhs.loc[sns[0], initially_up_indices] = 1
+    # Shut-down constraint - same logic
+    if has_scenarios_check:
+        # Create RHS as xarray with same shape as status
+        shut_down_scenarios = com_i.get_level_values(0).unique()
+        shut_down_names = com_i.get_level_values(1).unique()
+        rhs = DataArray(
+            0.0,
+            coords=[("snapshot", sns), ("scenario", shut_down_scenarios), ("name", shut_down_names)],
+            dims=["snapshot", "scenario", "name"]
+        )
+        # Set initial conditions for components that are initially up
+        for scenario, name in com_i:
+            if initially_up.sel(scenario=scenario, name=name).item():
+                rhs.loc[{"snapshot": sns[0], "scenario": scenario, "name": name}] = 1
+    else:
+        rhs = pd.DataFrame(0, sns, com_i)
+        initially_up_indices = com_i[initially_up.values]
+        if not initially_up_indices.empty:
+            rhs.loc[sns[0], initially_up_indices] = 1
 
     lhs_lower = shut_down + status_diff
     n.model.add_constraints(
@@ -509,52 +569,136 @@ def define_operational_constraints_for_committables(
     )
 
     # min up time
-    # Status variables no longer have scenario dimension
-    min_up_time_i = com_i[min_up_time_set.astype(bool)]
+    # Filter based on names that have min_up_time > 0
+    min_up_time_mask = min_up_time_set.astype(bool)
+    if has_scenarios:
+        # Find which names have min_up_time > 0 (check any scenario)
+        # Use .any() across scenario dimension to find names with any non-zero up_time
+        has_up_time = (min_up_time_set > 0).any(dim="scenario") if "scenario" in min_up_time_set.dims else (min_up_time_set > 0)
+        names_with_up_time = min_up_time_set.coords["name"].values[has_up_time.values]
+        if len(names_with_up_time) > 0:
+            scenarios = com_i.get_level_values(0).unique()  # Level 0 is scenario
+            min_up_time_i = pd.MultiIndex.from_product(
+                [scenarios, names_with_up_time],
+                names=["scenario", c.name]  # Use component name
+            )
+        else:
+            min_up_time_i = pd.MultiIndex.from_tuples([], names=["scenario", c.name])
+    else:
+        min_up_time_i = com_i[min_up_time_mask]
     
     if not min_up_time_i.empty:
-        expr = []
-        for g in min_up_time_i:
-            su = start_up.loc[:, g]
-            # Get the minimum up time value for generator g
-            up_time_value = int(min_up_time_set.sel(name=g).item())
-            expr.append(su.rolling(snapshot=up_time_value).sum())
-        lhs_lower = -status.loc[:, min_up_time_i] + merge(expr, dim=com_i.name)
-        lhs_lower = lhs_lower.sel(snapshot=sns[1:])
-        n.model.add_constraints(
-            lhs_lower,
-            "<=",
-            0,
-            name=f"{c.name}-com-up-time",
-            mask=active.loc[sns[1:], min_up_time_i],
-        )
+        if has_scenarios:
+            # For scenario-aware, create constraints per (scenario, name) pair
+            for g in min_up_time_i:
+                scenario, name = g
+                su = start_up.sel(scenario=scenario, name=name)
+                st = status.sel(scenario=scenario, name=name)
+                act = active.sel(scenario=scenario, name=name)
+                up_time_value = min_up_time_set.sel(scenario=scenario, name=name).item()
+                
+                su_rolled = su.rolling(snapshot=up_time_value).sum()
+                lhs_lower = -st + su_rolled
+                lhs_lower = lhs_lower.sel(snapshot=sns[1:])
+                n.model.add_constraints(
+                    lhs_lower,
+                    "<=",
+                    0,
+                    name=f"{c.name}-com-up-time-{scenario}-{name}",
+                    mask=act.loc[sns[1:]],
+                )
+        else:
+            # Original non-scenario logic
+            expr = []
+            for g in min_up_time_i:
+                su = start_up.loc[:, g]
+                up_time_value = min_up_time_set.sel(name=g).item()
+                expr.append(su.rolling(snapshot=up_time_value).sum())
+            
+            lhs_lower = -status.loc[:, min_up_time_i] + merge(expr, dim=com_i.name)
+            lhs_lower = lhs_lower.sel(snapshot=sns[1:])
+            n.model.add_constraints(
+                lhs_lower,
+                "<=",
+                0,
+                name=f"{c.name}-com-up-time",
+                mask=active.loc[sns[1:], min_up_time_i],
+            )
 
     # min down time
-    # Status variables no longer have scenario dimension
-    min_down_time_i = com_i[min_down_time_set.astype(bool)]
+    min_down_time_mask = min_down_time_set.astype(bool)
+    if has_scenarios:
+        # Find which names have min_down_time > 0 (check any scenario)
+        has_down_time = (min_down_time_set > 0).any(dim="scenario") if "scenario" in min_down_time_set.dims else (min_down_time_set > 0)
+        names_with_down_time = min_down_time_set.coords["name"].values[has_down_time.values]
+        if len(names_with_down_time) > 0:
+            scenarios = com_i.get_level_values(0).unique()  # Level 0 is scenario
+            min_down_time_i = pd.MultiIndex.from_product(
+                [scenarios, names_with_down_time],
+                names=["scenario", c.name]  # Use component name
+            )
+        else:
+            min_down_time_i = pd.MultiIndex.from_tuples([], names=["scenario", c.name])
+    else:
+        min_down_time_i = com_i[min_down_time_mask]
     
     if not min_down_time_i.empty:
-        expr = []
-        for g in min_down_time_i:
-            su = shut_down.loc[:, g]
-            # Get the minimum down time value for generator g
-            down_time_value = int(min_down_time_set.sel(name=g).item())
-            expr.append(su.rolling(snapshot=down_time_value).sum())
-        lhs_lower = status.loc[:, min_down_time_i] + merge(expr, dim=com_i.name)
-        lhs_lower = lhs_lower.sel(snapshot=sns[1:])
-        n.model.add_constraints(
-            lhs_lower,
-            "<=",
-            1,
-            name=f"{c.name}-com-down-time",
-            mask=active.loc[sns[1:], min_down_time_i],
-        )
+        if has_scenarios:
+            # For scenario-aware, create constraints per (scenario, name) pair
+            for g in min_down_time_i:
+                scenario, name = g
+                sd = shut_down.sel(scenario=scenario, name=name)
+                st = status.sel(scenario=scenario, name=name)
+                act = active.sel(scenario=scenario, name=name)
+                down_time_value = min_down_time_set.sel(scenario=scenario, name=name).item()
+                
+                sd_rolled = sd.rolling(snapshot=down_time_value).sum()
+                lhs_lower = st + sd_rolled
+                lhs_lower = lhs_lower.sel(snapshot=sns[1:])
+                n.model.add_constraints(
+                    lhs_lower,
+                    "<=",
+                    1,
+                    name=f"{c.name}-com-down-time-{scenario}-{name}",
+                    mask=act.loc[sns[1:]],
+                )
+        else:
+            # Original non-scenario logic
+            expr = []
+            for g in min_down_time_i:
+                su = shut_down.loc[:, g]
+                down_time_value = min_down_time_set.sel(
+                    {min_down_time_set.dims[0]: g}
+                ).item()
+                expr.append(su.rolling(snapshot=down_time_value).sum())
+            
+            lhs_lower = status.loc[:, min_down_time_i] + merge(expr, dim=com_i.name)
+            lhs_lower = lhs_lower.sel(snapshot=sns[1:])
+            n.model.add_constraints(
+                lhs_lower,
+                "<=",
+                1,
+                name=f"{c.name}-com-down-time",
+                mask=active.loc[sns[1:], min_down_time_i],
+            )
     # up time before
-    timesteps = xr.DataArray(
-        [range(1, len(sns) + 1)] * len(com_i),
-        coords=[com_i, sns],
-        dims=[com_i.name, "snapshot"],
-    )
+    if has_scenarios:
+        # Create timesteps with explicit scenario and name dimensions
+        scenarios_ts = com_i.get_level_values(0).unique()
+        names_ts = com_i.get_level_values(1).unique()
+        timesteps_data = np.tile(np.arange(1, len(sns) + 1), (len(scenarios_ts), len(names_ts), 1))
+        timesteps = DataArray(
+            timesteps_data,
+            coords=[("scenario", scenarios_ts), ("name", names_ts), ("snapshot", sns)],
+            dims=["scenario", "name", "snapshot"],
+        )
+    else:
+        timesteps = DataArray(
+            [range(1, len(sns) + 1)] * len(com_i),
+            coords=[com_i, sns],
+            dims=[com_i.name, "snapshot"],
+        )
+    
     if initially_up.any():
         must_stay_up = (min_up_time_set - up_time_before_set).clip(min=0)
         mask = (must_stay_up >= timesteps) & initially_up
@@ -571,8 +715,8 @@ def define_operational_constraints_for_committables(
         n.model.add_constraints(status, "=", 0, name=name, mask=mask)
 
     # linearized approximation because committable can partly start up and shut down
-    start_up_cost = c.da.start_up_cost.sel(name=com_i)
-    shut_down_cost = c.da.shut_down_cost.sel(name=com_i)
+    start_up_cost = c.da.start_up_cost.sel(name=names_only)
+    shut_down_cost = c.da.shut_down_cost.sel(name=names_only)
     cost_equal = (start_up_cost == shut_down_cost).values
 
     # only valid additional constraints if start up costs equal to shut down costs

@@ -69,20 +69,14 @@ def define_status_variables(
     if com_i.empty:
         return
 
-    # Remove scenario dimension from committables index (status is first-stage decision)
-    # This ensures consistency with investment variables (p_nom, e_nom, s_nom)
-    # which are also scenario-independent first-stage decisions
-    if isinstance(com_i, pd.MultiIndex):
-        com_i = com_i.unique(level="name")
+    # Status is a second-stage (wait-and-see) operational decision
+    # It should be scenario-dependent, unlike investment decisions (p_nom, e_nom, s_nom)
+    # Keep the full MultiIndex including scenario dimension
+    # This allows different on/off patterns per scenario based on realized conditions
 
-    # Build coordinates explicitly without scenario dimension
-    coords = [sns, com_i]
-    
-    # Get active mask (Linopy will handle broadcasting if active has scenario dimension)
+    # Get active mask with full coordinates including scenarios
     active = c.da.active.sel(name=com_i, snapshot=sns)
-    if "scenario" in active.dims:
-        # Unit is active if active in ANY scenario (conservative approach)
-        active = active.any(dim="scenario")
+    coords = active.coords
     
     is_binary = not is_linearized
     kwargs = {"upper": 1, "lower": 0} if not is_binary else {}
@@ -114,17 +108,13 @@ def define_start_up_variables(
     if com_i.empty:
         return
 
-    # Remove scenario dimension (start_up is first-stage decision, like status)
-    if isinstance(com_i, pd.MultiIndex):
-        com_i = com_i.unique(level="name")
+    # Start-up is a second-stage (wait-and-see) operational decision
+    # It should be scenario-dependent to allow different startup patterns per scenario
+    # Keep the full MultiIndex including scenario dimension
 
-    # Build coordinates explicitly without scenario dimension
-    coords = [sns, com_i]
-    
-    # Get active mask with scenario handling
+    # Get active mask with full coordinates including scenarios
     active = c.da.active.sel(name=com_i, snapshot=sns)
-    if "scenario" in active.dims:
-        active = active.any(dim="scenario")
+    coords = active.coords
     
     is_binary = not is_linearized
     kwargs = {"upper": 1, "lower": 0} if not is_binary else {}
@@ -160,17 +150,13 @@ def define_shut_down_variables(
     if com_i.empty:
         return
 
-    # Remove scenario dimension (shut_down is first-stage decision, like status)
-    if isinstance(com_i, pd.MultiIndex):
-        com_i = com_i.unique(level="name")
+    # Shut-down is a second-stage (wait-and-see) operational decision
+    # It should be scenario-dependent to allow different shutdown patterns per scenario
+    # Keep the full MultiIndex including scenario dimension
 
-    # Build coordinates explicitly without scenario dimension
-    coords = [sns, com_i]
-    
-    # Get active mask with scenario handling
+    # Get active mask with full coordinates including scenarios
     active = c.da.active.sel(name=com_i, snapshot=sns)
-    if "scenario" in active.dims:
-        active = active.any(dim="scenario")
+    coords = active.coords
     
     is_binary = not is_linearized
     kwargs = {"upper": 1, "lower": 0} if not is_binary else {}
