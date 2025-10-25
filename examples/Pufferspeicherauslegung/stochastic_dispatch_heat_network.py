@@ -134,16 +134,7 @@ def create_dispatch_network() -> pypsa.Network:
     print(f"COP range: {cop_timeseries.min():.2f} - {cop_timeseries.max():.2f}")
     print(f"Base demand range: {base_demand.min():.3f} - {base_demand.max():.3f} MW")
     
-    # Set up scenarios for forecast uncertainty
-    scenario_names = list(SCENARIOS.keys())
-    scenario_weights = {k: v['weight'] for k, v in SCENARIOS.items()}
-    n.set_scenarios(scenario_weights)
-    
-    print(f"\nScenarios ({len(scenario_names)}):")
-    for name, config in SCENARIOS.items():
-        print(f"  {name:25s} | {config['description']:35s} | Weight: {config['weight']:.0%}")
-    
-    # Add buses
+    # Add buses BEFORE scenarios
     n.add("Bus", "bus_electricity", carrier="electricity")
     n.add("Bus", "bus_heat", carrier="heat")
     
@@ -164,31 +155,25 @@ def create_dispatch_network() -> pypsa.Network:
         bus1="bus_heat",
         p_nom=HP_FIXED_CAPACITY_MW,  # FIXED capacity
         p_nom_extendable=False,  # NOT extendable
-        efficiency=1.0,  # Efficiency handled via COP in p_max_pu
-        committable=True,  # Unit commitment enabled
-        p_min_pu=HP_MIN_PART_LOAD,
+        efficiency=HP_BASE_COP,  # Use average COP for simplicity
+        committable=False,  # DISABLE unit commitment for now (causes issues with scenarios)
+        p_min_pu=0,  # Allow full flexibility
         marginal_cost=0,  # Cost via electricity price
-        start_up_cost=HP_STARTUP_COST,
-        min_up_time=HP_MIN_UPTIME,
-        min_down_time=HP_MIN_DOWNTIME,
-        up_time_before=0,
-        down_time_before=5,
     )
-    
-    # Set COP as p_max_pu (heat output = electric input × COP)
-    for scenario in scenario_names:
-        n.links_t.efficiency.loc[:, (scenario, "heat_pump")] = cop_timeseries
     
     # Add thermal storage with FIXED capacity
     n.add(
-        "Store",
+        "StorageUnit",  # Use StorageUnit instead of Store (better compatibility)
         "thermal_storage",
         bus="bus_heat",
-        e_nom=STORAGE_FIXED_CAPACITY_MWH,  # FIXED capacity
-        e_nom_extendable=False,  # NOT extendable
-        e_cyclic=True,
-        e_initial=STORAGE_FIXED_CAPACITY_MWH * 0.5,  # Start at 50% SOC
+        p_nom=STORAGE_FIXED_CAPACITY_MWH,  # Power rating equals energy (1C rate)
+        p_nom_extendable=False,
+        max_hours=1,  # Energy = Power × Hours
+        efficiency_store=STORAGE_EFFICIENCY,
+        efficiency_dispatch=STORAGE_EFFICIENCY,
         standing_loss=STORAGE_STANDING_LOSS,
+        cyclic_state_of_charge=True,
+        state_of_charge_initial=0.5,  # Start at 50%
         marginal_cost=0,
     )
     
@@ -209,6 +194,19 @@ def create_dispatch_network() -> pypsa.Network:
         bus="bus_heat",
         p_set=0,  # Will be set per scenario
     )
+    
+    # NOW set up scenarios for forecast uncertainty
+    scenario_names = list(SCENARIOS.keys())
+    scenario_weights = {k: v['weight'] for k, v in SCENARIOS.items()}
+    n.set_scenarios(scenario_weights)
+    
+    print(f"\nScenarios ({len(scenario_names)}):")
+    for name, config in SCENARIOS.items():
+        print(f"  {name:25s} | {config['description']:35s} | Weight: {config['weight']:.0%}")
+    
+    # Set COP as efficiency for heat pump (heat output = electric input × COP)
+    for scenario in scenario_names:
+        n.links_t.efficiency.loc[:, (scenario, "heat_pump")] = cop_timeseries
     
     # Apply scenario-specific modifications
     print("\nApplying scenario-specific parameters:")
