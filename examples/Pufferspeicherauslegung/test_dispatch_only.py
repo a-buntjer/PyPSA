@@ -99,7 +99,6 @@ def test_dispatch_only_basic():
     assert "scenario" in link_p.dims, "Dispatch should be scenario-dependent"
     
     print("✓ Test 1 passed: Basic dispatch_only works correctly")
-    return True
 
 
 def test_dispatch_only_requires_fixed_capacity():
@@ -144,10 +143,9 @@ def test_dispatch_only_requires_fixed_capacity():
         ]
         if any(msg in error_msg for msg in expected_msgs):
             print(f"✓ Test 2 passed: Correctly raised error: {error_msg[:80]}...")
-            return True
         else:
             print(f"❌ Test 2 failed: Wrong error message: {error_msg}")
-            return False
+            assert False, f"Wrong error message: {error_msg}"
 
 
 def test_dispatch_only_without_scenarios():
@@ -184,7 +182,6 @@ def test_dispatch_only_without_scenarios():
     assert condition == "optimal"
     
     print("✓ Test 3 passed: Works without scenarios (with warning)")
-    return True
 
 
 def test_dispatch_only_converts_extendable_to_fixed():
@@ -241,7 +238,6 @@ def test_dispatch_only_converts_extendable_to_fixed():
                 f"p_nom_opt ({p_nom_opt}) should equal fixed p_nom ({p_nom})"
     
     print("✓ Test 4 passed: Extendable converted to fixed correctly")
-    return True
 
 
 def test_dispatch_only_scenario_dependent_dispatch():
@@ -305,7 +301,6 @@ def test_dispatch_only_scenario_dependent_dispatch():
     # A better test would include storage arbitrage
     
     print("✓ Test 5 passed: Dispatch is scenario-dependent")
-    return True
 
 
 def run_all_tests():
