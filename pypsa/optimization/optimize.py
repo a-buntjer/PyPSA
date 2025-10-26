@@ -383,6 +383,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         multi_investment_periods: bool = False,
         transmission_losses: int = 0,
         linearized_unit_commitment: bool = False,
+        dispatch_only: bool = False,
         model_kwargs: dict | None = None,
         extra_functionality: Callable | None = None,
         assign_all_duals: bool = False,
@@ -408,6 +409,13 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             Defaults to 0, which ignores losses.
         linearized_unit_commitment : bool, default False
             Whether to optimise using the linearised unit commitment formulation or not.
+        dispatch_only : bool, default False
+            Whether to perform stochastic dispatch-only optimization with fixed capacities.
+            If True, all extendable components are converted to fixed capacity, enabling
+            pure operational optimization under uncertainty (e.g., forecast uncertainty for
+            prices or demand). Useful for stochastic operational planning where investment
+            decisions are not needed. Must be combined with n.set_scenarios() for stochastic
+            optimization. All nominal capacities (p_nom, e_nom, s_nom) must be pre-defined.
         model_kwargs : dict, optional
             Keyword arguments used by `linopy.Model`, such as `solver_dir` or `chunk`.
             Defaults to module wide option (default: {}). See
@@ -456,6 +464,61 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             solver_options = options.params.optimize.solver_options.copy()
 
         n = self._n
+        
+        # If dispatch_only mode, fix all extendable capacities
+        if dispatch_only:
+            logger.info("Dispatch-only mode: Fixing all extendable capacities")
+            
+            # Store original extendable flags for potential restoration
+            original_extendable = {}
+            has_capacity_issues = []
+            
+            for c_name in n.all_components:
+                c = n.components[c_name]
+                if c.empty:
+                    continue
+                    
+                # Check for extendable capacity attributes
+                for attr in ['p_nom_extendable', 'e_nom_extendable', 's_nom_extendable']:
+                    if attr not in c.static.columns:
+                        continue
+                    
+                    # Store original and set to False
+                    original_extendable[(c_name, attr)] = c.static[attr].copy()
+                    
+                    # Find components that were extendable
+                    was_extendable = c.static[attr] == True
+                    if was_extendable.any():
+                        c.static.loc[was_extendable, attr] = False
+                        
+                        # Verify nominal capacity is defined for those that were extendable
+                        nom_attr = attr.replace('_extendable', '')
+                        if nom_attr in c.static.columns:
+                            extendable_with_missing_nom = was_extendable & c.static[nom_attr].isna()
+                            if extendable_with_missing_nom.any():
+                                missing_names = c.static.index[extendable_with_missing_nom].tolist()
+                                if n.has_scenarios and isinstance(c.static.index, pd.MultiIndex):
+                                    # Extract just component names without scenario
+                                    missing_names = [name for _, name in missing_names]
+                                has_capacity_issues.append(
+                                    f"{c_name}.{nom_attr}: {missing_names[:3]}" + 
+                                    ("..." if len(missing_names) > 3 else "")
+                                )
+            
+            if has_capacity_issues:
+                msg = (
+                    f"dispatch_only=True requires all nominal capacities to be defined. "
+                    f"The following components have undefined capacities:\n  " +
+                    "\n  ".join(has_capacity_issues)
+                )
+                raise ValueError(msg)
+            
+            if not n.has_scenarios:
+                logger.warning(
+                    "dispatch_only=True is typically used with stochastic scenarios. "
+                    "Consider calling n.set_scenarios() before optimization."
+                )
+        
         sns = as_index(n, snapshots, "snapshots")
         n._multi_invest = int(multi_investment_periods)
         n._linearized_uc = linearized_unit_commitment
