@@ -1891,7 +1891,11 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
 
     ignored = global_conflict | period_conflict
     if ignored.any():
-        affected = c.static.index[ignored.values].tolist()
+        # Handle MultiIndex (stochastic) vs regular Index
+        if isinstance(c.static.index, pd.MultiIndex):
+            affected = c.static.index[ignored.values.ravel()].tolist()
+        else:
+            affected = c.static.index[ignored.values].tolist()
         logger.warning(
             "Stores %s: Cyclic energy level constraint overrules initial value setting. "
             "User-defined e_initial will be ignored.",
@@ -1904,7 +1908,11 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
             c.da.e_cyclic.sel(name=c.active_assets) & c.da.e_cyclic_per_period
         )
         if cp_overrides_c.any():
-            affected = c.static.index[cp_overrides_c.values].tolist()
+            # Handle MultiIndex (stochastic) vs regular Index
+            if isinstance(c.static.index, pd.MultiIndex):
+                affected = c.static.index[cp_overrides_c.values.ravel()].tolist()
+            else:
+                affected = c.static.index[cp_overrides_c.values].tolist()
             logger.warning(
                 "Stores %s: Per-period cyclic (e_cyclic_per_period=True) "
                 "overrides global cyclic (e_cyclic=True). "
