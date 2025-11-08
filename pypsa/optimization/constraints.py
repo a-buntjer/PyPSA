@@ -1869,6 +1869,19 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
             (periods == periods.shift(snapshot=1)) | c.da.e_cyclic_per_period
         )
 
+        # FIX: Handle dimension alignment for stochastic networks with scenarios
+        # The issue is that previous_e_pp and include_previous_e_pp may have different
+        # dimension orders after concat, causing broadcasting errors in .where()
+        # We need to ensure both have the same dimension order
+        if n.has_scenarios:
+            # Align dimensions explicitly by transposing to match include_previous_e_pp
+            # include_previous_e_pp typically has dims: (snapshot, name) or (snapshot, scenario, name)
+            # previous_e_pp from concat may have different order
+            target_dims = include_previous_e_pp.dims
+            if set(previous_e_pp.dims) == set(target_dims):
+                # Transpose to match target dimension order
+                previous_e_pp = previous_e_pp.transpose(*target_dims)
+        
         # We take values still to handle internal xarray multi-index difficulties
         previous_e_pp = previous_e_pp.where(
             include_previous_e_pp.values, linopy.variables.FILL_VALUE
