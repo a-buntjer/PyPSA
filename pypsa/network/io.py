@@ -1039,11 +1039,37 @@ class _ExporterNetCDF(_Exporter):
             if self.ds[v].dtype == np.float64:
                 self.ds[v] = self.ds[v].astype(np.float32)
 
+    def fix_mixed_dtype_object_arrays(self) -> None:
+        """Convert object arrays with mixed int/float types to float64.
+        
+        This is necessary for stochastic networks where time-varying attributes
+        may have mixed types across scenarios (e.g., some scenarios have int 
+        gas prices like 50, others have float like 85.5).
+        
+        NetCDF cannot handle object dtypes, so we convert them to float64.
+        """
+        logger.debug("Checking for object dtype variables with mixed numeric types.")
+        for v in self.ds.data_vars:
+            if self.ds[v].dtype == object:
+                try:
+                    # Try to convert to numeric (will handle int/float mix)
+                    converted = pd.to_numeric(self.ds[v].values.ravel(), errors='coerce')
+                    if not pd.isna(converted).all():
+                        # Successfully converted - reshape and assign as float64
+                        self.ds[v] = self.ds[v].astype(np.float64)
+                        logger.debug(f"Converted {v} from object to float64 (mixed numeric types)")
+                except (ValueError, TypeError):
+                    # Not numeric data, leave as is (will fail later if truly incompatible)
+                    logger.warning(f"Could not convert object dtype variable {v} to numeric")
+
     def finish(self) -> None:
         """Finish the export process.
 
         Runs post-processing, compression and saving to disk.
         """
+        # Fix mixed-type object arrays (for stochastic networks)
+        self.fix_mixed_dtype_object_arrays()
+        
         if self.float32:
             self.typecast_float32()
         if self.compression:
