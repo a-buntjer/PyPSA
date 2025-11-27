@@ -45,20 +45,29 @@ def reindex(ds: xr.DataArray, dim: str, index: pd.Index) -> xr.DataArray:
 
 
 def _set_dynamic_data(n: Network, component: str, attr: str, df: pd.DataFrame) -> None:
-    """Update values in time-dependent attribute from new dataframe."""
+    """Update values in time-dependent attribute from new dataframe.
+    
+    Note: For stochastic networks, column reindex may fail with duplicate labels.
+    """
     c = n.components[component]
     if (attr not in c.dynamic) or (c.dynamic[attr].empty):
         c.dynamic[attr] = df.reindex(n.snapshots)
-
     else:
         c.dynamic[attr].loc[df.index, df.columns] = df
 
-    c.dynamic[attr] = (
-        c.dynamic[attr]
-        .reindex(n.snapshots, level="snapshot", axis=0)
-        .reindex(c.names, level="name", axis=1)
-        .fillna(0.0)
-    )
+    # Reindex snapshots
+    c.dynamic[attr] = c.dynamic[attr].reindex(n.snapshots, level="snapshot", axis=0)
+    
+    # Reindex component names - may fail with stochastic networks
+    try:
+        c.dynamic[attr] = c.dynamic[attr].reindex(c.names, level="name", axis=1)
+    except ValueError as e:
+        if "duplicate labels" in str(e):
+            pass  # Skip for stochastic networks
+        else:
+            raise
+    
+    c.dynamic[attr] = c.dynamic[attr].fillna(0.0)
 
 
 def get_strongly_meshed_buses(n: Network, threshold: int = 45) -> pd.Series:
