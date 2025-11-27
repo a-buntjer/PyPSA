@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: PyPSA Contributors
+#
+# SPDX-License-Identifier: MIT
+
 """Define optimisation variables from PyPSA networks with Linopy."""
 
 from __future__ import annotations
@@ -65,8 +69,15 @@ def define_status_variables(
     if com_i.empty:
         return
 
+    # Status is a second-stage (wait-and-see) operational decision
+    # It should be scenario-dependent, unlike investment decisions (p_nom, e_nom, s_nom)
+    # Keep the full MultiIndex including scenario dimension
+    # This allows different on/off patterns per scenario based on realized conditions
+
+    # Get active mask with full coordinates including scenarios
     active = c.da.active.sel(name=com_i, snapshot=sns)
     coords = active.coords
+    
     is_binary = not is_linearized
     kwargs = {"upper": 1, "lower": 0} if not is_binary else {}
     n.model.add_variables(
@@ -97,8 +108,14 @@ def define_start_up_variables(
     if com_i.empty:
         return
 
+    # Start-up is a second-stage (wait-and-see) operational decision
+    # It should be scenario-dependent to allow different startup patterns per scenario
+    # Keep the full MultiIndex including scenario dimension
+
+    # Get active mask with full coordinates including scenarios
     active = c.da.active.sel(name=com_i, snapshot=sns)
     coords = active.coords
+    
     is_binary = not is_linearized
     kwargs = {"upper": 1, "lower": 0} if not is_binary else {}
     n.model.add_variables(
@@ -133,8 +150,14 @@ def define_shut_down_variables(
     if com_i.empty:
         return
 
+    # Shut-down is a second-stage (wait-and-see) operational decision
+    # It should be scenario-dependent to allow different shutdown patterns per scenario
+    # Keep the full MultiIndex including scenario dimension
+
+    # Get active mask with full coordinates including scenarios
     active = c.da.active.sel(name=com_i, snapshot=sns)
     coords = active.coords
+    
     is_binary = not is_linearized
     kwargs = {"upper": 1, "lower": 0} if not is_binary else {}
     n.model.add_variables(
@@ -242,10 +265,10 @@ def define_cvar_variables(n: Network) -> None:
     This helper adds three auxiliary variables to the model when
     stochastic optimisation with risk preference is enabled.
 
-    * ``CVaR-a`` (per-scenario, non-negative): auxiliary excess loss variables ``a_s``.
-      They linearise the tail expectation: ``a_s >= OPEX_s - theta``.
-    * ``CVaR-theta`` (scalar): the Value-at-Risk (VaR) level ``theta`` at confidence ``alpha``.
-    * ``CVaR`` (scalar): the Conditional Value-at-Risk (Expected Shortfall) objective term.
+    * `CVaR-a` (per-scenario, non-negative): auxiliary excess loss variables `a_s`.
+      They linearise the tail expectation: `a_s >= OPEX_s - theta`.
+    * `CVaR-theta` (scalar): the Value-at-Risk (VaR) level `theta` at confidence `alpha`.
+    * `CVaR` (scalar): the Conditional Value-at-Risk (Expected Shortfall) objective term.
 
     These variables are linked by constraints (added in the objective construction)
     to implement the linear CVaR formulation.

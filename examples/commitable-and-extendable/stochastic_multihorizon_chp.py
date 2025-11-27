@@ -241,10 +241,10 @@ def build_base_network() -> pypsa.Network:
         marginal_cost=1.0,  # Increased from 0.5
         p_max_pu=wind_profile_series,
         lifetime=25,
-        build_year=2025,
+        build_year=2025,  # Available from start
     )
     
-    # Solar - becomes available from 2030
+    # Solar - becomes available from 2030 (cost reduction)
     n.add(
         "Generator",
         "solar_pv",
@@ -256,7 +256,7 @@ def build_base_network() -> pypsa.Network:
         marginal_cost=0.3,
         p_max_pu=solar_profile_series,
         lifetime=25,
-        build_year=2025,
+        build_year=2030,  # Available from 2030 (technology maturity)
     )
     
     # === Gas supply ===
@@ -286,7 +286,7 @@ def build_base_network() -> pypsa.Network:
         capital_cost=550,
         p_nom_extendable=True,
         lifetime=20,
-        build_year=2030,  # Available from 2030
+        build_year=2035,  # Available from 2035 (emerging technology)
     )
     
     # === Wholesale market connection ===
@@ -332,6 +332,7 @@ def build_base_network() -> pypsa.Network:
         standing_loss=0.012,
         lifetime=25,
         build_year=2025,
+        e_cyclic=True,  # Re-enabled: Bug fix applied to PyPSA constraints.py
     )
     
     # === CHP plant (extendable + committable) - CONSTANT P/Q RATIO formulation ===
@@ -382,10 +383,10 @@ def build_base_network() -> pypsa.Network:
         p_nom_extendable=True,
         marginal_cost=15,
         lifetime=20,
-        build_year=2025,
+        build_year=2025,  # Available from start (conventional technology)
     )
     
-    # Peak gas turbine (now with committable enabled!)
+    # Peak gas turbine (becomes available in 2030)
     n.add(
         "Link",
         "gas_peaker",
@@ -398,7 +399,7 @@ def build_base_network() -> pypsa.Network:
         p_nom_extendable=True,
         marginal_cost=3,
         lifetime=30,
-        build_year=2025,
+        build_year=2030,  # Available from 2030 (flexible backup technology)
     )
     
     
@@ -591,6 +592,7 @@ def add_chp_coupling_constraints(n: pypsa.Network) -> None:
     
     # Solve the model
     n.optimize.solve_model(
+        multi_investment_periods=True,
         solver_options={
             "mip_rel_gap": 0.1,  # 10% gap for faster solving
             "threads": 16,

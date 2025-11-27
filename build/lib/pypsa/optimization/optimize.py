@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: PyPSA Contributors
+#
+# SPDX-License-Identifier: MIT
+
 """Build optimisation problems from PyPSA networks with Linopy."""
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from pypsa.common import UnexpectedError, as_index
 from pypsa.components.array import _from_xarray
 from pypsa.components.common import as_components
 from pypsa.descriptors import nominal_attrs
-from pypsa.guards import _optimize_guard
+from pypsa.guards import _assert_data_integrity
 from pypsa.optimization.abstract import OptimizationAbstractMixin
 from pypsa.optimization.common import _set_dynamic_data, get_strongly_meshed_buses
 from pypsa.optimization.constraints import (
@@ -363,7 +367,10 @@ def define_objective(n: Network, sns: pd.Index) -> None:
 
 
 class OptimizationAccessor(OptimizationAbstractMixin):
-    """Optimization accessor for building and solving models using linopy."""
+    """Optimization accessor for building and solving models using linopy.
+
+    <!-- md:guide network-optimization.md -->
+    """
 
     def __init__(self, n: Network) -> None:
         """Initialize the optimization accessor."""
@@ -376,6 +383,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         multi_investment_periods: bool = False,
         transmission_losses: int = 0,
         linearized_unit_commitment: bool = False,
+        dispatch_only: bool = False,
         model_kwargs: dict | None = None,
         extra_functionality: Callable | None = None,
         assign_all_duals: bool = False,
@@ -393,7 +401,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             n.snapshots, defaults to n.snapshots
         multi_investment_periods : bool, default False
             Whether to optimise as a single investment period or to optimise in multiple
-            investment periods. Then, snapshots should be a ``pd.MultiIndex``.
+            investment periods. Then, snapshots should be a `pd.MultiIndex`.
         transmission_losses : int, default 0
             Whether an approximation of transmission losses should be included
             in the linearised power flow formulation. A passed number will denote
@@ -401,10 +409,17 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             Defaults to 0, which ignores losses.
         linearized_unit_commitment : bool, default False
             Whether to optimise using the linearised unit commitment formulation or not.
+        dispatch_only : bool, default False
+            Whether to perform stochastic dispatch-only optimization with fixed capacities.
+            If True, all extendable components are converted to fixed capacity, enabling
+            pure operational optimization under uncertainty (e.g., forecast uncertainty for
+            prices or demand). Useful for stochastic operational planning where investment
+            decisions are not needed. Must be combined with n.set_scenarios() for stochastic
+            optimization. All nominal capacities (p_nom, e_nom, s_nom) must be pre-defined.
         model_kwargs : dict, optional
             Keyword arguments used by `linopy.Model`, such as `solver_dir` or `chunk`.
             Defaults to module wide option (default: {}). See
-            https://go.pypsa.org/options-params for more information.
+            `https://go.pypsa.org/options-params` for more information.
         extra_functionality : callable
             This function must take two arguments
             `extra_functionality(n, snapshots)` and is called after
@@ -416,12 +431,12 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             have a designated place in the network.
         solver_name : str, optional
             Name of the solver to use. Defaults to module wide option
-            (default: 'highs'). See https://go.pypsa.org/options-params for more
+            (default: 'highs'). See `https://go.pypsa.org/options-params` for more
             information.
         solver_options : dict, optional
             Keyword arguments used by the solver. Can also be passed via `**kwargs`.
             Defaults to module wide option (default: {}). See
-            https://go.pypsa.org/options-params for more information.
+            `https://go.pypsa.org/options-params` for more information.
         compute_infeasibilities : bool, default False
             Whether to compute and print Irreducible Inconsistent Subsystem (IIS) in case
             of an infeasible solution. Requires Gurobi.
@@ -433,11 +448,11 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         -------
         status : str
             The status of the optimization, either "ok" or one of the codes listed
-            in https://linopy.readthedocs.io/en/latest/generated/linopy.constants.SolverStatus.html
+            in [linopy.constants.SolverStatus](https://linopy.readthedocs.io/en/latest/generated/linopy.constants.SolverStatus.html)
         condition : str
             The termination condition of the optimization, either
             "optimal" or one of the codes listed in
-            https://linopy.readthedocs.io/en/latest/generated/linopy.constants.TerminationCondition.html
+            [linopy.constants.TerminationCondition](https://linopy.readthedocs.io/en/latest/generated/linopy.constants.TerminationCondition.html)
 
         """
         # Handle default parameters from options
@@ -449,6 +464,61 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             solver_options = options.params.optimize.solver_options.copy()
 
         n = self._n
+        
+        # If dispatch_only mode, fix all extendable capacities
+        if dispatch_only:
+            logger.info("Dispatch-only mode: Fixing all extendable capacities")
+            
+            # Store original extendable flags for potential restoration
+            original_extendable = {}
+            has_capacity_issues = []
+            
+            for c_name in n.all_components:
+                c = n.components[c_name]
+                if c.empty:
+                    continue
+                    
+                # Check for extendable capacity attributes
+                for attr in ['p_nom_extendable', 'e_nom_extendable', 's_nom_extendable']:
+                    if attr not in c.static.columns:
+                        continue
+                    
+                    # Store original and set to False
+                    original_extendable[(c_name, attr)] = c.static[attr].copy()
+                    
+                    # Find components that were extendable
+                    was_extendable = c.static[attr] == True
+                    if was_extendable.any():
+                        c.static.loc[was_extendable, attr] = False
+                        
+                        # Verify nominal capacity is defined for those that were extendable
+                        nom_attr = attr.replace('_extendable', '')
+                        if nom_attr in c.static.columns:
+                            extendable_with_missing_nom = was_extendable & c.static[nom_attr].isna()
+                            if extendable_with_missing_nom.any():
+                                missing_names = c.static.index[extendable_with_missing_nom].tolist()
+                                if n.has_scenarios and isinstance(c.static.index, pd.MultiIndex):
+                                    # Extract just component names without scenario
+                                    missing_names = [name for _, name in missing_names]
+                                has_capacity_issues.append(
+                                    f"{c_name}.{nom_attr}: {missing_names[:3]}" + 
+                                    ("..." if len(missing_names) > 3 else "")
+                                )
+            
+            if has_capacity_issues:
+                msg = (
+                    f"dispatch_only=True requires all nominal capacities to be defined. "
+                    f"The following components have undefined capacities:\n  " +
+                    "\n  ".join(has_capacity_issues)
+                )
+                raise ValueError(msg)
+            
+            if not n.has_scenarios:
+                logger.warning(
+                    "dispatch_only=True is typically used with stochastic scenarios. "
+                    "Consider calling n.set_scenarios() before optimization."
+                )
+        
         sns = as_index(n, snapshots, "snapshots")
         n._multi_invest = int(multi_investment_periods)
         n._linearized_uc = linearized_unit_commitment
@@ -500,7 +570,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             n.snapshots, defaults to n.snapshots
         multi_investment_periods : bool, default: False
             Whether to optimise as a single investment period or to optimize in multiple
-            investment periods. Then, snapshots should be a ``pd.MultiIndex``.
+            investment periods. Then, snapshots should be a `pd.MultiIndex`.
         transmission_losses : int, default: 0
             Whether an approximation of transmission losses should be included
             in the linearised power flow formulation.
@@ -639,12 +709,12 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             add/change constraints and add/change the objective function.
         solver_name : str | None, default=None
             Name of the solver to use. Defaults to module wide option
-            (default: 'highs'). See https://go.pypsa.org/options-params for more
+            (default: 'highs'). See `https://go.pypsa.org/options-params` for more
             information.
         solver_options : dict | None, default=None
             Keyword arguments used by the solver. Defaults to module wide option
             (default: {}). Can also be passed via `**kwargs`. See
-            https://go.pypsa.org/options-params for more information.
+            `https://go.pypsa.org/options-params` for more information.
         assign_all_duals : bool, default False
             Whether to assign all dual values or only those that already
             have a designated place in the network.
@@ -657,11 +727,11 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         status : str
             The status of the optimization, either "ok" or one of the
             codes listed in
-            https://linopy.readthedocs.io/en/latest/generated/linopy.constants.SolverStatus.html
+            [linopy.constants.SolverStatus](https://linopy.readthedocs.io/en/latest/generated/linopy.constants.SolverStatus.html)
         condition : str
             The termination condition of the optimization, either
             "optimal" or one of the codes listed in
-            https://linopy.readthedocs.io/en/latest/generated/linopy.constants.TerminationCondition.html
+            [linopy.constants.TerminationCondition](https://linopy.readthedocs.io/en/latest/generated/linopy.constants.TerminationCondition.html)
 
         """
         # Handle default parameters from options
@@ -683,7 +753,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
 
         # Optional runtime verification
         if options.debug.runtime_verification:
-            _optimize_guard(self._n)
+            _assert_data_integrity(self._n)
 
         return status, condition
 
@@ -739,7 +809,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
                         _set_dynamic_data(n, c.name, f"p{i}", -df * eff)
                         c.dynamic[f"p{i}"].loc[
                             sns, c.static.index[c.static[f"bus{i}"] == ""]
-                        ] = float(c.attrs.loc[f"p{i}", "default"])
+                        ] = float(c.defaults.loc[f"p{i}", "default"])
 
                 else:
                     _set_dynamic_data(n, c.name, attr, df)

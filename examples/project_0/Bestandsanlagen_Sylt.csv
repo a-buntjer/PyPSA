@@ -1,0 +1,10 @@
+Standort,Anlage,Typ,Baujahr,Leistung_kWth,Leistung_kWel,Eingespeiste_Wärme_MWh,Eingespeister_Strom_MWh,Erdgaseinsatz_MWh_Hs,Anteil_Wärme_%,Wirkungsgrad_thermisch,Wirkungsgrad_elektrisch
+Friesische Str. 53,Kessel 1,Kessel,2020,5000,,5250,,6363,19.98,0.92,
+Friesische Str. 53,BHKW 1,BHKW,2020,1341,999,4191,2743,8351,15.95,0.8,0.38
+Friesische Str. 53,BHKW 2,BHKW,2020,1341,999,7264,4754,14472,27.64,0.8,0.38
+Dr.-Nicolas-Str. 1,Kessel 2,Kessel,1995,2400,,,,6,0.02,0.9,
+Dr.-Nicolas-Str. 1,Kessel 3,Kessel,1995,2400,,,,,,0.9,
+Dr.-Nicolas-Str. 1,Kessel 4,Kessel,1997,3200,,,,,,0.9,
+Andreas-Dirks-Str. 4-6,Kessel 5,Kessel,1999,1350,,2747,,3132,11.2,0.9,
+Andreas-Dirks-Str. 4-6,Kessel 6,Kessel,1999,1900,,,,,,0.9,
+Andreas-Dirks-Str. 4-6,BHKW 3,BHKW,2009,811,625,6817,5160,14671,25.5,0.8,0.38
