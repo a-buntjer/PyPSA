@@ -194,12 +194,29 @@ def create_realistic_heat_network(
     n.add("Carrier", "solar")
     n.add("Carrier", "wind")
     n.add("Carrier", "gas")
+    n.add("Carrier", "chp")
 
     # =========================================================================
     # Add buses
     # =========================================================================
     n.add("Bus", "elec_bus", carrier="electricity")
     n.add("Bus", "heat_bus", carrier="heat")
+    n.add("Bus", "gas_bus", carrier="gas")  # Gas bus for CHP
+
+    # =========================================================================
+    # Create electricity market price profile (variable)
+    # =========================================================================
+    
+    # Electricity market price: varies by time of day and season
+    # Base price ~50 €/MWh, higher during peak hours, lower at night
+    price_daily = 50 + 30 * np.sin(np.pi * (hour_of_day - 6) / 12)  # Peak at noon
+    price_seasonal = 1.0 + 0.3 * np.cos(2 * np.pi * (day_of_year - 15) / 365)  # Higher in winter
+    electricity_price = price_daily * price_seasonal
+    electricity_price = np.clip(electricity_price, 20, 120)  # €/MWh
+    
+    # Repeat for multi-investment periods
+    if len(investment_periods) > 1:
+        electricity_price = np.tile(electricity_price, len(investment_periods))
 
     # =========================================================================
     # Add generators
@@ -217,7 +234,7 @@ def create_realistic_heat_network(
         p_nom_max=500,  # MW
         p_max_pu=solar_cf,
         marginal_cost=0,
-        capital_cost=50000,  # €/MW/year
+        capital_cost=0,  # €/MW/year (free for testing all components)
         build_year=investment_periods[0] if len(investment_periods) > 1 else 2020,
         lifetime=25,
     )
@@ -234,31 +251,103 @@ def create_realistic_heat_network(
         p_nom_max=300,  # MW
         p_max_pu=wind_cf,
         marginal_cost=0,
-        capital_cost=80000,  # €/MW/year
+        capital_cost=0,  # €/MW/year (free for testing all components)
         build_year=investment_periods[0] if len(investment_periods) > 1 else 2020,
         lifetime=25,
     )
 
-    # Gas backup - not extendable
+    # Gas backup - not extendable (small capacity to force renewables)
     n.add(
         "Generator",
         "gas",
         bus="elec_bus",
         carrier="gas",
-        p_nom=200,  # MW
+        p_nom=50,  # MW (reduced to force renewable investment)
         p_nom_extendable=False,
-        marginal_cost=80,  # €/MWh
+        marginal_cost=120,  # €/MWh (increased - expensive peak power)
     )
 
-    # Gas boiler for heat backup
+    # Gas boiler for heat - connected to gas_bus via Link
+    # Converts gas to heat with ~90% efficiency
+    n.add(
+        "Link",
+        "gas_boiler",
+        bus0="gas_bus",
+        bus1="heat_bus",
+        carrier="gas",
+        p_nom=100,  # MW_gas input
+        p_nom_extendable=False,
+        efficiency=0.9,  # 90% thermal efficiency
+    )
+
+    # =========================================================================
+    # Add CHP (Combined Heat and Power) - 3-port Link
+    # =========================================================================
+
+    # CHP: bus0=gas input, bus1=electricity output, bus2=heat output
+    # Typical efficiencies: electrical ~40%, thermal ~45%, total ~85%
+    n.add(
+        "Link",
+        "chp",
+        bus0="gas_bus",
+        bus1="elec_bus",
+        bus2="heat_bus",
+        carrier="chp",
+        p_nom=0,  # MW_gas input
+        p_nom_extendable=True,
+        p_nom_max=200,  # Max 200 MW gas input
+        efficiency=0.4,  # 40% electrical efficiency
+        efficiency2=0.45,  # 45% thermal efficiency
+        capital_cost=2000,  # €/MW/a (moderate - profitable when elec price high)
+        build_year=investment_periods[0] if len(investment_periods) > 1 else 2020,
+        lifetime=25,
+    )
+
+    # Gas supply for CHP (gas price affects CHP vs heat pump dispatch)
     n.add(
         "Generator",
-        "gas_boiler",
-        bus="heat_bus",
+        "gas_supply",
+        bus="gas_bus",
         carrier="gas",
-        p_nom=100,  # MW_th
-        p_nom_extendable=False,
-        marginal_cost=60,  # €/MWh_th (gas cost / efficiency)
+        p_nom=1000,  # Large capacity
+        marginal_cost=50,  # €/MWh_gas (moderate gas price)
+    )
+
+    # =========================================================================
+    # Add Grid Market Connection (bidirectional - can buy and sell)
+    # =========================================================================
+
+    # Variable electricity price with daily and seasonal patterns
+    hours = np.arange(n_hours)
+    hour_of_day_local = hours % 24
+    day_of_week = hours // 24
+
+    # Price pattern: base 120 €/MWh, peaks during day, lower at night
+    # Range approximately 60-180 €/MWh
+    np.random.seed(42)  # For reproducibility
+    elec_price = (
+        120  # Base price (high to make renewables competitive)
+        + 40 * np.sin(2 * np.pi * hour_of_day_local / 24 - np.pi / 2)  # Daily pattern (peak at noon)
+        + 20 * np.cos(2 * np.pi * day_of_week / 7)  # Weekly pattern
+        + 10 * np.random.randn(n_hours)  # Random noise
+    )
+    elec_price = np.clip(elec_price, 50, 250)  # Clip to realistic range
+
+    # Repeat for multi-investment periods
+    if len(investment_periods) > 1:
+        elec_price = np.tile(elec_price, len(investment_periods))
+
+    # Grid market generator with p_min_pu=-1 allows:
+    # - Positive power: selling to grid (earning marginal_cost)
+    # - Negative power: buying from grid (paying marginal_cost)
+    n.add(
+        "Generator",
+        "grid_market",
+        bus="elec_bus",
+        carrier="grid",
+        p_nom=50,  # MW capacity (limited to force local generation)
+        p_min_pu=-1,  # Can also consume (buy from grid)
+        marginal_cost=elec_price,  # Variable electricity price
     )
 
     # =========================================================================
@@ -283,8 +372,8 @@ def create_realistic_heat_network(
         p_nom_extendable=True,
         p_nom_min=0,
         p_nom_max=100,  # MW_el
-        efficiency=cop,  # Time-varying COP
-        capital_cost=40000,  # €/MW_el/year
+        efficiency=cop,  # Time-varying COP (2.0-4.5)
+        capital_cost=0,  # €/MW_el/year (free - dispatched when electricity cheap)
         build_year=investment_periods[0] if len(investment_periods) > 1 else 2020,
         lifetime=20,
     )
@@ -304,7 +393,7 @@ def create_realistic_heat_network(
         e_nom_max=500,  # MWh_th
         e_cyclic=True,  # Important for temporal clustering!
         standing_loss=0.01,  # 1% per hour
-        capital_cost=5000,  # €/MWh/year
+        capital_cost=100,  # €/MWh/year (very low for 1-week test)
         build_year=investment_periods[0] if len(investment_periods) > 1 else 2020,
         lifetime=30,
     )
@@ -324,7 +413,7 @@ def create_realistic_heat_network(
         e_nom_max=200,  # MWh
         e_cyclic=True,
         standing_loss=0.0001,  # Very low self-discharge
-        capital_cost=15000,  # €/MWh/year
+        capital_cost=200,  # €/MWh/year (very low for 1-week test)
         build_year=investment_periods[0] if len(investment_periods) > 1 else 2020,
         lifetime=15,
     )
@@ -443,6 +532,96 @@ def compare_optimization_results(
             )
     except Exception:
         pass
+
+    # =========================================================================
+    # 3. Energy generation comparison
+    # =========================================================================
+    
+    print("\n" + "=" * 70)
+    print("ENERGY GENERATION COMPARISON (MWh)")
+    print("=" * 70)
+    print(f"{'Generator':<20} {'Full':>15} {'Clustered':>15} {'Deviation':>12}")
+    print("-" * 70)
+    
+    def get_generator_energy(n, gen_name):
+        """Calculate total energy generated by a generator."""
+        try:
+            if gen_name not in n.generators_t.p.columns:
+                # Check for MultiIndex columns (stochastic)
+                if isinstance(n.generators_t.p.columns, pd.MultiIndex):
+                    # Sum across all scenarios
+                    matching_cols = [c for c in n.generators_t.p.columns if c[-1] == gen_name]
+                    if matching_cols:
+                        # Get power for first scenario and multiply by weightings
+                        p = n.generators_t.p[matching_cols[0]]
+                        weights = n.snapshot_weightings["generators"]
+                        return (p * weights).sum()
+                return 0.0
+            
+            p = n.generators_t.p[gen_name]
+            weights = n.snapshot_weightings["generators"]
+            return (p * weights).sum()
+        except Exception:
+            return 0.0
+    
+    def get_link_energy(n, link_name):
+        """Calculate total energy throughput of a link."""
+        try:
+            if link_name not in n.links_t.p0.columns:
+                if isinstance(n.links_t.p0.columns, pd.MultiIndex):
+                    matching_cols = [c for c in n.links_t.p0.columns if c[-1] == link_name]
+                    if matching_cols:
+                        p = n.links_t.p0[matching_cols[0]]
+                        weights = n.snapshot_weightings["generators"]
+                        return (p * weights).sum()
+                return 0.0
+            
+            p = n.links_t.p0[link_name]
+            weights = n.snapshot_weightings["generators"]
+            return (p * weights).sum()
+        except Exception:
+            return 0.0
+    
+    # Generator energies
+    gen_names = ["solar", "wind", "gas", "gas_supply", "grid_market"]
+    for gen in gen_names:
+        energy_full = get_generator_energy(n_full, gen)
+        energy_clustered = get_generator_energy(n_clustered, gen)
+        
+        if abs(energy_full) > 0.1 or abs(energy_clustered) > 0.1:
+            if abs(energy_full) > 0.1:
+                deviation = (energy_clustered - energy_full) / abs(energy_full) * 100
+                dev_str = f"{deviation:+.1f}%"
+            else:
+                dev_str = "N/A"
+            print(f"{gen:<20} {energy_full:>15.1f} {energy_clustered:>15.1f} {dev_str:>12}")
+            
+            # Store in metrics
+            metrics[f"{gen}_energy_full_MWh"] = energy_full
+            metrics[f"{gen}_energy_clustered_MWh"] = energy_clustered
+    
+    print("-" * 70)
+    
+    # Link energies (heat pump, CHP, gas_boiler)
+    print("\nLINK ENERGY THROUGHPUT (MWh - bus0 input)")
+    print("-" * 70)
+    link_names = ["heat_pump", "chp", "gas_boiler"]
+    for link in link_names:
+        energy_full = get_link_energy(n_full, link)
+        energy_clustered = get_link_energy(n_clustered, link)
+        
+        if abs(energy_full) > 0.1 or abs(energy_clustered) > 0.1:
+            if abs(energy_full) > 0.1:
+                deviation = (energy_clustered - energy_full) / abs(energy_full) * 100
+                dev_str = f"{deviation:+.1f}%"
+            else:
+                dev_str = "N/A"
+            print(f"{link:<20} {energy_full:>15.1f} {energy_clustered:>15.1f} {dev_str:>12}")
+            
+            metrics[f"{link}_energy_full_MWh"] = energy_full
+            metrics[f"{link}_energy_clustered_MWh"] = energy_clustered
+    
+    print("=" * 70)
 
     return metrics
 

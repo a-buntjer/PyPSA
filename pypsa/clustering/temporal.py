@@ -538,6 +538,22 @@ def cluster_temporally(
     hours_per_period : int, default 24
         Length of each period in hours. Common values are 24 (daily),
         168 (weekly), or 8760 (yearly).
+
+        **Important for storage modeling**: The ``hours_per_period`` parameter
+        significantly affects storage accuracy. With ``e_cyclic=True``, storages
+        must return to their initial state at the end of **each typical period**.
+        This means:
+
+        - **Daily periods (24h)**: Only intra-day storage cycles are captured.
+          Multi-day storage patterns are lost, often leading to significant
+          over- or underestimation of storage capacity (up to +300% error).
+        - **Weekly periods (168h)**: Preserves multi-day and weekend patterns.
+          Recommended for thermal storage, batteries with multi-day cycles.
+        - **Longer periods**: Better for seasonal storage, but less complexity
+          reduction.
+
+        Rule of thumb: Set ``hours_per_period`` to match or exceed the typical
+        storage cycle duration in your system.
     n_segments : int, optional
         Number of segments within each period. If None, no segmentation
         is applied. Segmentation further reduces complexity by merging
@@ -646,6 +662,20 @@ def cluster_temporally(
     )
 
     logger.info(f"Collected {len(time_series.columns)} time series for clustering")
+
+    # Check for storage components and warn about potential accuracy issues
+    has_stores = len(n.stores) > 0
+    has_storage_units = len(n.storage_units) > 0
+    if (has_stores or has_storage_units) and hours_per_period < 168:
+        storage_names = list(n.stores.index) + list(n.storage_units.index)
+        logger.warning(
+            f"Network contains storage components ({storage_names}) but "
+            f"hours_per_period={hours_per_period} < 168. With e_cyclic=True, "
+            f"storages must complete their cycle within each typical period. "
+            f"This can lead to significant over- or underestimation of storage "
+            f"capacity (up to +300% error for multi-day storage). Consider using "
+            f"hours_per_period=168 (weekly) for more accurate storage modeling."
+        )
 
     # Prepare tsam parameters
     tsam_kwargs: dict[str, Any] = {
