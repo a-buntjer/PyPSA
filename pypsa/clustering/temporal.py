@@ -353,11 +353,26 @@ def _apply_typical_periods_to_network(
                 c.static = pd.concat(
                     dict.fromkeys(original_scenarios, c.static), names=["scenario"]
                 )
+            else:
+                # For empty DataFrames, create proper MultiIndex
+                # to match the scenario structure
+                empty_idx = pd.MultiIndex.from_tuples(
+                    [], names=["scenario", "name"]
+                )
+                c.static = c.static.reindex(empty_idx)
+            
             for k, v in c.dynamic.items():
                 if not v.empty:
                     c.dynamic[k] = pd.concat(
                         dict.fromkeys(original_scenarios, v), names=["scenario"], axis=1
                     )
+                else:
+                    # For empty DataFrames, create proper MultiIndex columns
+                    # to match the scenario structure
+                    empty_cols = pd.MultiIndex.from_tuples(
+                        [], names=["scenario", "name"]
+                    )
+                    c.dynamic[k] = pd.DataFrame(index=new_index, columns=empty_cols)
         n_clustered._scenarios_data = original_scenario_weightings
 
     logger.info(
