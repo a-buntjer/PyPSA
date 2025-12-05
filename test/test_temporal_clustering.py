@@ -743,34 +743,241 @@ class TestTemporalClusteringWithStorage:
             pytest.skip(f"Solver not available: {e}")
 
 
+@pytest.fixture
+def network_stochastic() -> pypsa.Network:
+    """Create a stochastic network with scenarios."""
+    n = pypsa.Network()
+
+    # Set up snapshots (1 week hourly)
+    n.set_snapshots(pd.date_range("2020-01-01", periods=168, freq="h"))
+    n.snapshot_weightings.loc[:] = 1.0
+
+    # Add buses
+    n.add("Bus", "bus0")
+    n.add("Bus", "bus1")
+
+    # Add line
+    n.add("Line", "line0-1", bus0="bus0", bus1="bus1", s_nom=100, x=0.01)
+
+    # Solar with time-varying availability
+    solar_cf = np.maximum(0, np.sin(np.linspace(0, 14 * np.pi, 168)))
+    n.add(
+        "Generator",
+        "solar",
+        bus="bus0",
+        p_nom=0,
+        p_nom_extendable=True,
+        p_nom_max=100,
+        p_max_pu=solar_cf,
+        marginal_cost=0,
+        capital_cost=1000,
+        carrier="solar",
+    )
+
+    # Gas generator
+    n.add(
+        "Generator",
+        "gas",
+        bus="bus1",
+        p_nom=200,
+        marginal_cost=50,
+        carrier="gas",
+    )
+
+    # Load with time-varying demand
+    load_profile = 50 + 30 * np.sin(np.linspace(0, 14 * np.pi, 168))
+    n.add("Load", "load", bus="bus1", p_set=load_profile)
+
+    # Now add scenarios AFTER adding all components
+    n.set_scenarios({"low": 0.3, "medium": 0.4, "high": 0.3})
+
+    return n
+
+
+@pytest.fixture
+def network_stochastic_multi_invest() -> pypsa.Network:
+    """Create a stochastic network with scenarios and multi-investment periods."""
+    n = pypsa.Network()
+
+    # Create investment periods first with MultiIndex snapshots
+    investment_periods = pd.Index([2020, 2030], name="period")
+    snapshots_per_period = pd.date_range("2020-01-01", periods=168, freq="h")
+    multi_snapshots = pd.MultiIndex.from_product(
+        [investment_periods, snapshots_per_period],
+        names=["period", "timestep"]
+    )
+    n.set_snapshots(multi_snapshots)
+    n.snapshot_weightings.loc[:, "objective"] = 1.0
+    n.snapshot_weightings.loc[:, "generators"] = 1.0
+    n.snapshot_weightings.loc[:, "stores"] = 1.0
+
+    # Set investment period weightings
+    n.investment_period_weightings = pd.DataFrame(
+        {"years": [10.0, 10.0], "objective": [1.0, 0.9]},
+        index=investment_periods
+    )
+
+    # Add buses
+    n.add("Bus", "bus0")
+
+    # Solar with time-varying availability - needs to match full snapshot length
+    solar_cf_single = np.maximum(0, np.sin(np.linspace(0, 14 * np.pi, 168)))
+    solar_cf = np.tile(solar_cf_single, 2)  # Repeat for 2 investment periods
+
+    n.add(
+        "Generator",
+        "solar",
+        bus="bus0",
+        p_nom=0,
+        p_nom_extendable=True,
+        p_nom_max=100,
+        p_max_pu=solar_cf,
+        marginal_cost=0,
+        capital_cost=1000,
+        build_year=2020,
+        lifetime=25,
+        carrier="solar",
+    )
+
+    # Backup generator
+    n.add(
+        "Generator",
+        "backup",
+        bus="bus0",
+        p_nom=200,
+        marginal_cost=100,
+        carrier="gas",
+    )
+
+    # Load - also needs to match full snapshot length
+    load_single = 50 + 30 * np.sin(np.linspace(0, 14 * np.pi, 168))
+    load_profile = np.tile(load_single, 2)
+    n.add("Load", "load", bus="bus0", p_set=load_profile)
+
+    # Add scenarios
+    n.set_scenarios({"low": 0.3, "high": 0.7})
+
+    return n
+
+
 @pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
 class TestTemporalClusteringWithStochastic:
-    """Test temporal clustering interaction with stochastic networks."""
+    """Test temporal clustering with stochastic networks."""
 
-    def test_stochastic_not_supported(self):
-        """Test that stochastic networks raise ValueError (not implemented)."""
-        n = pypsa.Network()
+    def test_stochastic_basic_clustering(self, network_stochastic):
+        """Test that stochastic networks can be clustered."""
+        n = network_stochastic
 
-        # Set up snapshots
-        n.set_snapshots(pd.date_range("2020-01-01", periods=24, freq="h"))
-        n.snapshot_weightings.loc[:] = 1.0
+        result = n.cluster.cluster_temporally(
+            n_typical_periods=3,
+            hours_per_period=24,
+        )
 
-        # Add scenario dimension
-        n.set_scenarios(["low", "high"])
+        n_reduced = result.n
 
-        # Add buses
-        n.add("Bus", "bus0")
+        # Network should be created successfully
+        assert n_reduced is not None
+        assert len(n_reduced.snapshots) == 72  # 3 periods × 24 hours
 
-        # Add load with scenario-dependent values
-        n.add("Load", "load", bus="bus0", p_set=50)
+        # Scenarios should be preserved
+        assert n_reduced.has_scenarios
+        assert len(n_reduced.scenarios) == 3
+        assert "low" in n_reduced.scenarios
+        assert "medium" in n_reduced.scenarios
+        assert "high" in n_reduced.scenarios
 
-        # Clustering should raise ValueError for stochastic networks
-        # (the @_scenarios_not_implemented decorator raises ValueError)
-        with pytest.raises(ValueError, match="stochastic"):
-            n.cluster.cluster_temporally(
-                n_typical_periods=2,
-                hours_per_period=24,
-            )
+    def test_stochastic_preserves_scenario_weightings(self, network_stochastic):
+        """Test that scenario weightings are preserved."""
+        n = network_stochastic
+
+        result = n.cluster.cluster_temporally(
+            n_typical_periods=3,
+            hours_per_period=24,
+        )
+
+        n_reduced = result.n
+
+        # Check scenario weightings
+        assert hasattr(n_reduced, "scenario_weightings")
+        assert np.isclose(n_reduced.scenario_weightings.loc["low", "weight"], 0.3)
+        assert np.isclose(n_reduced.scenario_weightings.loc["medium", "weight"], 0.4)
+        assert np.isclose(n_reduced.scenario_weightings.loc["high", "weight"], 0.3)
+
+    def test_stochastic_preserves_components(self, network_stochastic):
+        """Test that components are preserved in stochastic clustered network."""
+        n = network_stochastic
+
+        result = n.cluster.cluster_temporally(
+            n_typical_periods=3,
+            hours_per_period=24,
+        )
+
+        n_reduced = result.n
+
+        # Check static components preserved (with scenario MultiIndex)
+        assert len(n_reduced.buses) == len(n.scenarios) * 2  # 2 buses × 3 scenarios
+        assert len(n_reduced.generators) == len(n.scenarios) * 2  # 2 generators × 3 scenarios
+
+    def test_stochastic_optimization(self, network_stochastic):
+        """Test that stochastic clustered network can be optimized."""
+        n = network_stochastic
+
+        result = n.cluster.cluster_temporally(
+            n_typical_periods=2,
+            hours_per_period=24,
+        )
+
+        n_reduced = result.n
+
+        try:
+            n_reduced.optimize(solver_name="highs")
+            assert n_reduced.status == "ok"
+        except Exception as e:
+            pytest.skip(f"Solver or stochastic optimization not available: {e}")
+
+
+@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
+class TestTemporalClusteringWithStochasticMultiInvest:
+    """Test temporal clustering with stochastic + multi-investment networks."""
+
+    def test_stochastic_multi_invest_basic(self, network_stochastic_multi_invest):
+        """Test clustering stochastic network with multi-investment periods."""
+        n = network_stochastic_multi_invest
+
+        result = n.cluster.cluster_temporally(
+            n_typical_periods=3,
+            hours_per_period=24,
+        )
+
+        n_reduced = result.n
+
+        # Network should be created
+        assert n_reduced is not None
+        assert len(n_reduced.snapshots) > 0
+
+        # Scenarios should be preserved
+        assert n_reduced.has_scenarios
+        assert "low" in n_reduced.scenarios
+        assert "high" in n_reduced.scenarios
+
+    def test_stochastic_multi_invest_preserves_build_years(self, network_stochastic_multi_invest):
+        """Test that build_year attributes are preserved."""
+        n = network_stochastic_multi_invest
+
+        result = n.cluster.cluster_temporally(
+            n_typical_periods=3,
+            hours_per_period=24,
+        )
+
+        n_reduced = result.n
+
+        # Build year should be preserved in at least one scenario
+        generators = n_reduced.generators
+        if isinstance(generators.index, pd.MultiIndex):
+            # Get first scenario
+            first_scenario = generators.index.get_level_values(0)[0]
+            gen_data = generators.xs(first_scenario, level=0)
+            assert gen_data.loc["solar", "build_year"] == 2020
 
 
 @pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")

@@ -87,7 +87,6 @@ class ClusteringAccessor:
 
     # Temporal clustering methods
 
-    @_scenarios_not_implemented
     @wraps(temporal.cluster_temporally)
     def cluster_temporally(
         self, *args: Any, **kwargs: Any
@@ -96,6 +95,8 @@ class ClusteringAccessor:
 
         This function reduces the temporal complexity of a PyPSA network by
         aggregating similar time periods into representative typical periods.
+        
+        Supports stochastic networks and multi-investment periods.
 
         Wraps [`pypsa.clustering.temporal.cluster_temporally`][].
 
@@ -120,7 +121,6 @@ class ClusteringAccessor:
         """
         return temporal.cluster_temporally(self.n, *args, **kwargs)
 
-    @_scenarios_not_implemented
     @wraps(temporal.get_optimal_aggregation_params)
     def get_optimal_aggregation_params(
         self, *args: Any, **kwargs: Any

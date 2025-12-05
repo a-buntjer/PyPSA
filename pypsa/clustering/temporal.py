@@ -109,6 +109,7 @@ def _collect_time_series(
     include_stores: bool = True,
     include_links: bool = True,
     custom_columns: dict[str, pd.Series] | None = None,
+    scenario: str | None = None,
 ) -> pd.DataFrame:
     """Collect all relevant time series from the network.
 
@@ -128,6 +129,9 @@ def _collect_time_series(
         Include link time series (efficiency, p_max_pu).
     custom_columns : dict, optional
         Additional custom time series to include.
+    scenario : str, optional
+        For stochastic networks, the scenario to extract data for.
+        If None and network has scenarios, uses first scenario.
 
     Returns
     -------
@@ -136,51 +140,78 @@ def _collect_time_series(
     """
     dfs = []
 
+    # Helper function to extract scenario-specific data from dynamic DataFrames
+    def _get_dynamic_data(df: pd.DataFrame, component_prefix: str, attr: str) -> pd.DataFrame | None:
+        if df.empty:
+            return None
+        
+        df_copy = df.copy()
+        
+        # Handle MultiIndex columns for stochastic networks
+        if isinstance(df_copy.columns, pd.MultiIndex):
+            if scenario is not None:
+                # Extract specific scenario
+                if scenario in df_copy.columns.get_level_values(0):
+                    df_copy = df_copy.xs(scenario, axis=1, level=0)
+                else:
+                    logger.warning(f"Scenario '{scenario}' not found in {component_prefix}-{attr}")
+                    return None
+            else:
+                # Use first scenario as reference
+                first_scenario = df_copy.columns.get_level_values(0)[0]
+                df_copy = df_copy.xs(first_scenario, axis=1, level=0)
+        
+        # Handle MultiIndex rows (for multi-investment periods)
+        if isinstance(df_copy.index, pd.MultiIndex):
+            # Flatten by using only timestep level
+            if "timestep" in df_copy.index.names:
+                df_copy = df_copy.droplevel([l for l in df_copy.index.names if l != "timestep"])
+            elif "period" in df_copy.index.names:
+                # For multi-invest, keep first period's timesteps as base
+                first_period = df_copy.index.get_level_values(0)[0]
+                df_copy = df_copy.xs(first_period, level=0)
+        
+        df_copy.columns = [f"{component_prefix}-{attr}-{c}" for c in df_copy.columns]
+        return df_copy
+
     if include_generators:
         # Generator availability profiles
-        if not n.generators_t.p_max_pu.empty:
-            gen_pu = n.generators_t.p_max_pu.copy()
-            gen_pu.columns = [f"Generator-p_max_pu-{c}" for c in gen_pu.columns]
+        gen_pu = _get_dynamic_data(n.generators_t.p_max_pu, "Generator", "p_max_pu")
+        if gen_pu is not None:
             dfs.append(gen_pu)
 
         # Generator marginal costs (if time-varying)
-        if not n.generators_t.marginal_cost.empty:
-            gen_mc = n.generators_t.marginal_cost.copy()
-            gen_mc.columns = [f"Generator-marginal_cost-{c}" for c in gen_mc.columns]
+        gen_mc = _get_dynamic_data(n.generators_t.marginal_cost, "Generator", "marginal_cost")
+        if gen_mc is not None:
             dfs.append(gen_mc)
 
     if include_loads:
         # Load profiles
-        if not n.loads_t.p_set.empty:
-            load_p = n.loads_t.p_set.copy()
-            load_p.columns = [f"Load-p_set-{c}" for c in load_p.columns]
+        load_p = _get_dynamic_data(n.loads_t.p_set, "Load", "p_set")
+        if load_p is not None:
             dfs.append(load_p)
 
     if include_storage_units:
         # Storage unit inflow
-        if not n.storage_units_t.inflow.empty:
-            su_inflow = n.storage_units_t.inflow.copy()
-            su_inflow.columns = [f"StorageUnit-inflow-{c}" for c in su_inflow.columns]
+        su_inflow = _get_dynamic_data(n.storage_units_t.inflow, "StorageUnit", "inflow")
+        if su_inflow is not None:
             dfs.append(su_inflow)
 
     if include_stores:
         # Store inflow
-        if not n.stores_t.e_set.empty:
-            st_e = n.stores_t.e_set.copy()
-            st_e.columns = [f"Store-e_set-{c}" for c in st_e.columns]
+        st_e = _get_dynamic_data(n.stores_t.e_set, "Store", "e_set")
+        if st_e is not None:
             dfs.append(st_e)
 
     if include_links:
         # Link efficiency profiles
-        if not n.links_t.efficiency.empty:
-            link_eff = n.links_t.efficiency.copy()
-            link_eff.columns = [f"Link-efficiency-{c}" for c in link_eff.columns]
+        link_eff = _get_dynamic_data(n.links_t.efficiency, "Link", "efficiency")
+        if link_eff is not None:
             dfs.append(link_eff)
 
         # Link availability profiles
-        if not n.links_t.p_max_pu.empty:
-            link_pu = n.links_t.p_max_pu.copy()
-            link_pu.columns = [f"Link-p_max_pu-{c}" for c in link_pu.columns]
+        link_pu = _get_dynamic_data(n.links_t.p_max_pu, "Link", "p_max_pu")
+        if link_pu is not None:
             dfs.append(link_pu)
 
     # Add custom columns
@@ -240,8 +271,19 @@ def _apply_typical_periods_to_network(
     # Get clustering information
     period_weights = pd.Series(aggregation.clusterPeriodNoOccur)
 
-    # Create new network
-    n_clustered = n.copy()
+    # Store original network info
+    has_scenarios = n.has_scenarios
+    has_investment_periods = len(n.investment_periods) > 0
+    original_scenarios = n.scenarios if has_scenarios else None
+    original_scenario_weightings = n._scenarios_data.copy() if has_scenarios else None
+    original_investment_periods = n.investment_periods.copy() if has_investment_periods else None
+    original_investment_weightings = n.investment_period_weightings.copy() if has_investment_periods else None
+
+    # Create new network - start fresh to avoid issues with complex indices
+    n_clustered = pypsa.Network()
+    
+    # Copy meta information
+    n_clustered.name = n.name
 
     # Create new snapshot index
     n_periods = len(period_weights)
@@ -250,7 +292,7 @@ def _apply_typical_periods_to_network(
     if aggregation.segmentation:
         # With segmentation: variable number of time steps per period
         new_snapshots = []
-        snapshot_weightings = []
+        snapshot_weightings_list = []
 
         for period_idx in range(n_periods):
             segment_durations = aggregation.segmentDurationDict.get(period_idx, {})
@@ -264,30 +306,59 @@ def _apply_typical_periods_to_network(
                 # Calculate weighting: period occurrences * segment duration
                 period_occur = period_weights.get(period_idx, 1)
                 seg_duration = segment_durations.get(seg_idx, 1)
-                snapshot_weightings.append(period_occur * seg_duration)
+                snapshot_weightings_list.append(period_occur * seg_duration)
 
         new_index = pd.Index(new_snapshots, name="snapshot")
-        weightings = pd.Series(snapshot_weightings, index=new_index)
+        weightings = pd.Series(snapshot_weightings_list, index=new_index)
     else:
         # Without segmentation: regular structure
         new_snapshots = []
-        snapshot_weightings = []
+        snapshot_weightings_list = []
 
         for period_idx in range(n_periods):
             for hour in range(hours_per_period):
                 snapshot_label = f"period_{period_idx}_hour_{hour}"
                 new_snapshots.append(snapshot_label)
-                snapshot_weightings.append(period_weights.get(period_idx, 1))
+                snapshot_weightings_list.append(period_weights.get(period_idx, 1))
 
         new_index = pd.Index(new_snapshots, name="snapshot")
-        weightings = pd.Series(snapshot_weightings, index=new_index)
+        weightings = pd.Series(snapshot_weightings_list, index=new_index)
 
     # Set new snapshots
     n_clustered.set_snapshots(new_index)
-    n_clustered.snapshot_weightings = weightings
+    
+    # Set snapshot weightings
+    n_clustered.snapshot_weightings.loc[:, "objective"] = weightings.values
+    n_clustered.snapshot_weightings.loc[:, "generators"] = weightings.values
+    n_clustered.snapshot_weightings.loc[:, "stores"] = weightings.values
 
+    # Copy all static components
+    _copy_static_components(n, n_clustered, has_scenarios)
+    
     # Apply typical periods to time-varying data
-    _apply_time_series_to_network(n_clustered, typical_periods, aggregation)
+    _apply_time_series_to_clustered_network(
+        n, n_clustered, typical_periods, aggregation, has_scenarios
+    )
+
+    # Restore investment periods if they existed
+    if has_investment_periods and original_investment_periods is not None:
+        n_clustered._investment_periods = original_investment_periods
+        n_clustered._investment_period_weightings = original_investment_weightings
+
+    # Restore scenarios if they existed
+    if has_scenarios and original_scenarios is not None:
+        # Replicate static data for each scenario
+        for c in n_clustered.components.values():
+            if not c.static.empty:
+                c.static = pd.concat(
+                    dict.fromkeys(original_scenarios, c.static), names=["scenario"]
+                )
+            for k, v in c.dynamic.items():
+                if not v.empty:
+                    c.dynamic[k] = pd.concat(
+                        dict.fromkeys(original_scenarios, v), names=["scenario"], axis=1
+                    )
+        n_clustered._scenarios_data = original_scenario_weightings
 
     logger.info(
         f"Created clustered network with {len(new_index)} snapshots "
@@ -297,22 +368,86 @@ def _apply_typical_periods_to_network(
     return n_clustered
 
 
-def _apply_time_series_to_network(
-    n: "Network",
+def _copy_static_components(
+    n_source: "Network", 
+    n_target: "Network",
+    has_scenarios: bool,
+) -> None:
+    """Copy all static components from source to target network.
+    
+    Parameters
+    ----------
+    n_source : Network
+        Source network to copy from.
+    n_target : Network
+        Target network to copy to.
+    has_scenarios : bool
+        Whether the source network has scenarios.
+    """
+    # List of component types to copy
+    component_types = [
+        ("Bus", "buses"),
+        ("Carrier", "carriers"),
+        ("Generator", "generators"),
+        ("Load", "loads"),
+        ("StorageUnit", "storage_units"),
+        ("Store", "stores"),
+        ("Line", "lines"),
+        ("Link", "links"),
+        ("Transformer", "transformers"),
+        ("ShuntImpedance", "shunt_impedances"),
+    ]
+    
+    for component_name, attr_name in component_types:
+        source_df = getattr(n_source, attr_name)
+        if source_df.empty:
+            continue
+            
+        # Handle MultiIndex for stochastic networks
+        if has_scenarios and isinstance(source_df.index, pd.MultiIndex):
+            # Get first scenario's data as reference
+            first_scenario = source_df.index.get_level_values(0)[0]
+            source_df = source_df.xs(first_scenario, level=0)
+        
+        # Add components one by one
+        for idx in source_df.index:
+            row = source_df.loc[idx]
+            kwargs = row.dropna().to_dict()
+            
+            # Remove internal columns
+            for col in ["_i", "sub_network"]:
+                kwargs.pop(col, None)
+            
+            try:
+                n_target.add(component_name, idx, **kwargs)
+            except Exception as e:
+                logger.debug(f"Could not add {component_name} {idx}: {e}")
+
+
+def _apply_time_series_to_clustered_network(
+    n_source: "Network",
+    n_target: "Network",
     typical_periods: pd.DataFrame,
     aggregation: Any,
+    has_scenarios: bool,
 ) -> None:
-    """Apply the typical period time series to network components.
+    """Apply the typical period time series to the clustered network.
 
     Parameters
     ----------
-    n : Network
-        The network to update (modified in-place).
+    n_source : Network
+        Original network (for reference).
+    n_target : Network
+        The clustered network to update (modified in-place).
     typical_periods : pd.DataFrame
         The typical periods data.
     aggregation : tsam.TimeSeriesAggregation
         The aggregation object.
+    has_scenarios : bool
+        Whether the source network has scenarios.
     """
+    scenarios = list(n_source.scenarios) if has_scenarios else [None]
+    
     # Map column names back to component attributes
     for col in typical_periods.columns:
         parts = col.split("-", 2)
@@ -320,19 +455,34 @@ def _apply_time_series_to_network(
             continue
 
         component, attr, name = parts
+        component_lower = component.lower()
+        
+        # Handle plural forms
+        if component_lower == "storageunit":
+            component_attr = "storage_units_t"
+        else:
+            component_attr = f"{component_lower}s_t"
 
         # Get the component's dynamic attribute DataFrame
         try:
-            component_t = getattr(n, f"{component.lower()}s_t")
+            component_t = getattr(n_target, component_attr)
             if hasattr(component_t, attr):
                 df = getattr(component_t, attr)
-                if name in df.columns or df.empty:
-                    # Assign the typical period values
-                    values = typical_periods[col].values
-                    if len(values) == len(n.snapshots):
+                
+                # Assign the typical period values
+                values = typical_periods[col].values
+                if len(values) == len(n_target.snapshots):
+                    if has_scenarios:
+                        # For stochastic networks, apply to all scenarios
+                        for scenario in scenarios:
+                            if isinstance(df.columns, pd.MultiIndex):
+                                df[(scenario, name)] = values
+                            else:
+                                df[name] = values
+                    else:
                         df[name] = values
-        except (AttributeError, KeyError):
-            logger.debug(f"Could not apply {col} to network")
+        except (AttributeError, KeyError) as e:
+            logger.debug(f"Could not apply {col} to network: {e}")
             continue
 
 
