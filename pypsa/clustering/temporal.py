@@ -324,6 +324,38 @@ def _apply_typical_periods_to_network(
         new_index = pd.Index(new_snapshots, name="snapshot")
         weightings = pd.Series(snapshot_weightings_list, index=new_index)
 
+    # Handle Multi-Investment-Periods: Create MultiIndex (period, timestep)
+    if has_investment_periods and original_investment_periods is not None:
+        # For multi-invest, we need to replicate typical periods for each investment period
+        # and create a proper MultiIndex
+        multi_snapshots = []
+        multi_weightings = []
+        
+        for inv_period in original_investment_periods:
+            for snap, weight in zip(new_snapshots, snapshot_weightings_list):
+                multi_snapshots.append((inv_period, snap))
+                # Weight includes investment period weighting
+                inv_weight = original_investment_weightings.get(inv_period, 1.0)
+                multi_weightings.append(weight)  # tsam weights only, inv weights applied separately
+        
+        new_index = pd.MultiIndex.from_tuples(
+            multi_snapshots, 
+            names=["period", "timestep"]
+        )
+        weightings = pd.Series(multi_weightings, index=new_index)
+        
+        # Also need to expand typical_periods for each investment period
+        expanded_typical = pd.DataFrame()
+        for inv_period in original_investment_periods:
+            period_df = typical_periods.copy()
+            period_df.index = pd.MultiIndex.from_tuples(
+                [(inv_period, f"period_{i // hours_per_period}_hour_{i % hours_per_period}") 
+                 for i in range(len(period_df))],
+                names=["period", "timestep"]
+            )
+            expanded_typical = pd.concat([expanded_typical, period_df])
+        typical_periods = expanded_typical
+
     # Set new snapshots
     n_clustered.set_snapshots(new_index)
     
@@ -344,6 +376,8 @@ def _apply_typical_periods_to_network(
     if has_investment_periods and original_investment_periods is not None:
         n_clustered._investment_periods = original_investment_periods
         n_clustered._investment_period_weightings = original_investment_weightings
+        # Mark as multi-invest network
+        n_clustered._multi_invest = True
 
     # Restore scenarios if they existed
     if has_scenarios and original_scenarios is not None:
