@@ -85,5 +85,72 @@ class ClusteringAccessor:
         """Wrap [`get_clustering_from_busmap`][pypsa.clustering.ClusteringAccessor.get_clustering_from_busmap]."""
         return spatial.get_clustering_from_busmap(self.n, *args, **kwargs)
 
+    # Temporal clustering methods
+
+    @_scenarios_not_implemented
+    @wraps(temporal.cluster_temporally)
+    def cluster_temporally(
+        self, *args: Any, **kwargs: Any
+    ) -> "temporal.TemporalClustering":
+        """Cluster network snapshots to typical periods using tsam.
+
+        This function reduces the temporal complexity of a PyPSA network by
+        aggregating similar time periods into representative typical periods.
+
+        Wraps [`pypsa.clustering.temporal.cluster_temporally`][].
+
+        Returns
+        -------
+        TemporalClustering
+            Container with the clustered network and aggregation details.
+            Access the reduced network via `result.n`.
+
+        Examples
+        --------
+        >>> result = n.clustering.cluster_temporally(
+        ...     n_typical_periods=12,
+        ...     hours_per_period=24,
+        ...     cluster_method="hierarchical"
+        ... )
+        >>> n_reduced = result.n
+
+        See Also
+        --------
+        pypsa.clustering.temporal.cluster_temporally : Full documentation
+        """
+        return temporal.cluster_temporally(self.n, *args, **kwargs)
+
+    @_scenarios_not_implemented
+    @wraps(temporal.get_optimal_aggregation_params)
+    def get_optimal_aggregation_params(
+        self, *args: Any, **kwargs: Any
+    ) -> tuple[int, int, float]:
+        """Find optimal number of periods and segments for temporal clustering.
+
+        Uses tsam's HyperTunedAggregations to find the Pareto-optimal combination.
+
+        Wraps [`pypsa.clustering.temporal.get_optimal_aggregation_params`][].
+
+        Returns
+        -------
+        n_segments : int
+            Optimal number of segments.
+        n_periods : int
+            Optimal number of typical periods.
+        rmse : float
+            Root mean square error of the aggregation.
+
+        Examples
+        --------
+        >>> segments, periods, rmse = n.clustering.get_optimal_aggregation_params(
+        ...     target_reduction=0.05  # Reduce to 5% of original data
+        ... )
+        >>> result = n.clustering.cluster_temporally(
+        ...     n_typical_periods=periods,
+        ...     n_segments=segments
+        ... )
+        """
+        return temporal.get_optimal_aggregation_params(self.n, *args, **kwargs)
+
 
 __all__ = ["ClusteringAccessor", "spatial", "temporal"]
