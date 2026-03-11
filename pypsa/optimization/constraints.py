@@ -273,6 +273,18 @@ def define_operational_constraints_for_committables(
     ramp_shut_down = nominal * c.da.ramp_limit_shut_down.sel(name=com_i).fillna(1)
     up_time_before_set = c.da.up_time_before.sel(name=com_i)
     down_time_before_set = c.da.down_time_before.sel(name=com_i)
+
+    # For stochastic networks, static UC parameters have an extra 'scenario'
+    # dimension but are identical across scenarios. Reduce to 1-D (name only).
+    if "scenario" in min_up_time_set.dims:
+        min_up_time_set = min_up_time_set.isel(scenario=0, drop=True)
+    if "scenario" in min_down_time_set.dims:
+        min_down_time_set = min_down_time_set.isel(scenario=0, drop=True)
+    if "scenario" in up_time_before_set.dims:
+        up_time_before_set = up_time_before_set.isel(scenario=0, drop=True)
+    if "scenario" in down_time_before_set.dims:
+        down_time_before_set = down_time_before_set.isel(scenario=0, drop=True)
+
     initially_up = up_time_before_set.astype(bool)
     initially_down = down_time_before_set.astype(bool)
 
@@ -445,18 +457,18 @@ def define_operational_constraints_for_committables(
     if not min_up_time_i.empty:
         expr = []
         for g in min_up_time_i:
-            su = start_up.loc[:, g]
+            su = start_up.sel(name=g)
             # Retrieve the minimum up time value for generator g and convert it to a scalar
             up_time_value = min_up_time_set.sel(name=g).item()
             expr.append(su.rolling(snapshot=up_time_value).sum())
-        lhs = -status.loc[:, min_up_time_i] + merge(expr, dim=com_i.name)
+        lhs = -status.sel(name=min_up_time_i) + merge(expr, dim=com_i.name)
         lhs = lhs.sel(snapshot=sns[1:])
         n.model.add_constraints(
             lhs,
             "<=",
             0,
             name=f"{c.name}-com-up-time",
-            mask=active.loc[sns[1:], min_up_time_i],
+            mask=active.sel(snapshot=sns[1:], name=min_up_time_i),
         )
 
     # min down time
@@ -464,19 +476,17 @@ def define_operational_constraints_for_committables(
     if not min_down_time_i.empty:
         expr = []
         for g in min_down_time_i:
-            su = shut_down.loc[:, g]
-            down_time_value = min_down_time_set.sel(
-                {min_down_time_set.dims[0]: g}
-            ).item()
+            su = shut_down.sel(name=g)
+            down_time_value = min_down_time_set.sel(name=g).item()
             expr.append(su.rolling(snapshot=down_time_value).sum())
-        lhs = status.loc[:, min_down_time_i] + merge(expr, dim=com_i.name)
+        lhs = status.sel(name=min_down_time_i) + merge(expr, dim=com_i.name)
         lhs = lhs.sel(snapshot=sns[1:])
         n.model.add_constraints(
             lhs,
             "<=",
             1,
             name=f"{c.name}-com-down-time",
-            mask=active.loc[sns[1:], min_down_time_i],
+            mask=active.sel(snapshot=sns[1:], name=min_down_time_i),
         )
     # up time before
     timesteps = xr.DataArray(
@@ -1440,12 +1450,12 @@ def define_committability_variables_constraints_with_fixed_upper_limit(
 
     active = c.da.active.sel(snapshot=sns, name=inter_i) if n._multi_invest else None
 
-    status = m.variables[f"{component}-status"].loc[sns, inter_i]
+    status = m.variables[f"{component}-status"].sel(snapshot=sns, name=inter_i)
     m.add_constraints(
         status, "<=", rhs, name=f"{component}-status-{attr}-fixed-upper", mask=active
     )
 
-    start_up = m.variables[f"{component}-start_up"].loc[sns, inter_i]
+    start_up = m.variables[f"{component}-start_up"].sel(snapshot=sns, name=inter_i)
     m.add_constraints(
         start_up,
         "<=",
@@ -1454,7 +1464,7 @@ def define_committability_variables_constraints_with_fixed_upper_limit(
         mask=active,
     )
 
-    shut_down = m.variables[f"{component}-shut_down"].loc[sns, inter_i]
+    shut_down = m.variables[f"{component}-shut_down"].sel(snapshot=sns, name=inter_i)
     m.add_constraints(
         shut_down,
         "<=",
@@ -1510,19 +1520,19 @@ def define_committability_variables_constraints_with_variable_upper_limit(
 
     n_mod = m[f"{component}-n_mod"].loc[inter_i]
 
-    status = m.variables[f"{component}-status"].loc[sns, inter_i]
+    status = m.variables[f"{component}-status"].sel(snapshot=sns, name=inter_i)
     lhs = ((1, status), (-1, n_mod))
     m.add_constraints(
         lhs, "<=", 0, name=f"{component}-status-{attr}-variable-upper", mask=active
     )
 
-    start_up = m.variables[f"{component}-start_up"].loc[sns, inter_i]
+    start_up = m.variables[f"{component}-start_up"].sel(snapshot=sns, name=inter_i)
     lhs = ((1, start_up), (-1, n_mod))
     m.add_constraints(
         lhs, "<=", 0, name=f"{component}-start_up-{attr}-variable-upper", mask=active
     )
 
-    shut_down = m.variables[f"{component}-shut_down"].loc[sns, inter_i]
+    shut_down = m.variables[f"{component}-shut_down"].sel(snapshot=sns, name=inter_i)
     lhs = ((1, shut_down), (-1, n_mod))
     m.add_constraints(
         lhs, "<=", 0, name=f"{component}-shut_down-{attr}-variable-upper", mask=active
