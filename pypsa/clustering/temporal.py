@@ -2,33 +2,21 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Functions for temporal clustering of networks using tsam.
+"""Functions for temporal clustering of networks.
 
-This module provides time series aggregation capabilities for PyPSA networks
-using the tsam (time series aggregation module) library. It enables reduction
-of computational complexity by clustering time periods into representative
-typical periods.
+This module provides methods to reduce the temporal resolution of PyPSA networks
+while preserving the total modeled hours through snapshot weighting adjustments,
+so that the total number of hours modelled is kept invariant.
 
-References
-----------
-.. [1] Kotzur, L., Markewitz, P., Robinius, M., & Stolten, D. (2018).
-       Impact of different time series aggregation methods on optimal energy
-       system design. Renewable Energy, 117, 474-487.
-
-.. [2] Hoffmann, M., Kotzur, L., Stolten, D., & Robinius, M. (2020).
-       A review on time series aggregation methods for energy system models.
-       Energies, 13(3), 641.
-
-.. [3] Hoffmann, M., Kotzur, L., & Stolten, D. (2022).
-       The Pareto-Optimal Temporal Aggregation of Energy System Models.
-       Applied Energy, 315, 118857.
+**Invariant**: ``sum(weights) == total_modeled_hours`` (e.g., 8760 for one year)
 """
 
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+import warnings
+from dataclasses import dataclass
+from importlib.util import find_spec
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -36,888 +24,917 @@ import pandas as pd
 if TYPE_CHECKING:
     from pypsa import Network
 
-logger = logging.getLogger(__name__)
 
-# Check if tsam is available
-try:
-    import tsam.timeseriesaggregation as tsam
+def _warn_if_solved(n: Network) -> None:
+    """Warn if applying temporal clustering to a solved network."""
+    has_results = any(
+        not c.dynamic.get("p", pd.DataFrame()).empty
+        for c in n.components
+        if "p" in c.dynamic
+    )
+    if has_results:
+        warnings.warn(
+            "Applying temporal clustering to a solved network may result in "
+            "inconsistent storage state of charge and dispatch values.",
+            UserWarning,
+            stacklevel=3,
+        )
 
-    HAS_TSAM = True
-except ImportError:
-    HAS_TSAM = False
-    tsam = None  # type: ignore
+
+def _check_no_scenarios(n: Network) -> None:
+    """Raise error if network has scenarios (stochastic)."""
+    if n.has_scenarios:
+        msg = "Temporal clustering does not yet support stochastic networks."
+        raise NotImplementedError(msg)
 
 
-ClusterMethod = Literal[
-    "averaging", "k_means", "k_medoids", "k_maxoids", "hierarchical", "adjacent_periods"
-]
+HOURS_PER_YEAR = 8760
 
-RepresentationMethod = Literal[
-    "meanRepresentation",
-    "medoidRepresentation",
-    "minmaxmeanRepresentation",
-    "durationRepresentation",
-    "distributionRepresentation",
-    "distributionAndMinMaxRepresentation",
-]
-
-ExtremePeriodMethod = Literal["None", "append", "new_cluster_center", "replace_cluster_center"]
+TEMPORAL_AGGREGATION_DEFAULTS: dict[str, str] = {
+    "default": "mean",
+    "e_max_pu": "min",
+    "e_min_pu": "max",
+}
 
 
 @dataclass
 class TemporalClustering:
-    """Result container for temporal clustering.
+    """Result of temporal clustering.
 
     Attributes
     ----------
     n : Network
-        The temporally clustered network with reduced snapshots.
-    aggregation : tsam.TimeSeriesAggregation
-        The tsam aggregation object containing clustering details.
-    typical_periods : pd.DataFrame
-        The typical periods data.
-    period_weights : pd.Series
-        Weights for each typical period (number of occurrences).
-    snapshot_map : pd.DataFrame
-        Mapping from original snapshots to clustered snapshots.
-    accuracy_indicators : pd.DataFrame
-        Quality metrics for the aggregation.
+        The clustered network with reduced temporal resolution.
+    snapshot_map : pd.Series
+        Mapping from original snapshots to aggregated snapshots.
+        Index: original snapshots, Values: aggregated snapshots.
+
     """
 
-    n: "Network"
-    aggregation: Any  # tsam.TimeSeriesAggregation
-    typical_periods: pd.DataFrame
-    period_weights: pd.Series
-    snapshot_map: pd.DataFrame = field(default_factory=pd.DataFrame)
-    accuracy_indicators: pd.DataFrame = field(default_factory=pd.DataFrame)
+    n: Network
+    snapshot_map: pd.Series
 
 
-def _check_tsam_installed() -> None:
-    """Check if tsam is installed and raise error if not."""
-    if not HAS_TSAM:
-        raise ImportError(
-            "The 'tsam' package is required for temporal clustering. "
-            "Install it with: pip install tsam"
-        )
-
-
-def _collect_time_series(
-    n: "Network",
-    include_generators: bool = True,
-    include_loads: bool = True,
-    include_storage_units: bool = True,
-    include_stores: bool = True,
-    include_links: bool = True,
-    custom_columns: dict[str, pd.Series] | None = None,
-    scenario: str | None = None,
-) -> pd.DataFrame:
-    """Collect all relevant time series from the network.
+def _get_aggregation_rule(
+    attr: str,
+    aggregation_rules: dict[str, str] | None = None,
+) -> str:
+    """Get aggregation rule for a component attribute.
 
     Parameters
     ----------
-    n : Network
-        The PyPSA network.
-    include_generators : bool, default True
-        Include generator time series (p_max_pu, marginal_cost).
-    include_loads : bool, default True
-        Include load time series (p_set).
-    include_storage_units : bool, default True
-        Include storage unit time series.
-    include_stores : bool, default True
-        Include store time series.
-    include_links : bool, default True
-        Include link time series (efficiency, p_max_pu).
-    custom_columns : dict, optional
-        Additional custom time series to include.
-    scenario : str, optional
-        For stochastic networks, the scenario to extract data for.
-        If None and network has scenarios, uses first scenario.
+    attr : str
+        Attribute name (e.g., "p_max_pu", "e_min_pu").
+    aggregation_rules : dict, optional
+        Custom aggregation rules overriding defaults.
+
+    Returns
+    -------
+    str
+        Aggregation function name ("mean", "min", "max", "sum").
+
+    """
+    if aggregation_rules and attr in aggregation_rules:
+        return aggregation_rules[attr]
+    return TEMPORAL_AGGREGATION_DEFAULTS.get(attr, "mean")
+
+
+def _handle_leap_day(weightings: pd.DataFrame) -> pd.DataFrame:
+    """Transfer leap day weights to March 1 rather than dropping hours.
+
+    Parameters
+    ----------
+    weightings : pd.DataFrame
+        Snapshot weightings with DatetimeIndex.
 
     Returns
     -------
     pd.DataFrame
-        Combined time series with datetime index.
+        Weightings with leap days removed and weights transferred.
+
     """
-    dfs = []
+    if not isinstance(weightings.index, pd.DatetimeIndex):
+        return weightings
 
-    # Helper function to extract scenario-specific data from dynamic DataFrames
-    def _get_dynamic_data(df: pd.DataFrame, component_prefix: str, attr: str) -> pd.DataFrame | None:
-        if df.empty:
-            return None
-        
-        df_copy = df.copy()
-        
-        # Handle MultiIndex columns for stochastic networks
-        if isinstance(df_copy.columns, pd.MultiIndex):
-            if scenario is not None:
-                # Extract specific scenario
-                if scenario in df_copy.columns.get_level_values(0):
-                    df_copy = df_copy.xs(scenario, axis=1, level=0)
-                else:
-                    logger.warning(f"Scenario '{scenario}' not found in {component_prefix}-{attr}")
-                    return None
-            else:
-                # Use first scenario as reference
-                first_scenario = df_copy.columns.get_level_values(0)[0]
-                df_copy = df_copy.xs(first_scenario, axis=1, level=0)
-        
-        # Handle MultiIndex rows (for multi-investment periods)
-        if isinstance(df_copy.index, pd.MultiIndex):
-            # Flatten by using only timestep level
-            if "timestep" in df_copy.index.names:
-                df_copy = df_copy.droplevel([l for l in df_copy.index.names if l != "timestep"])
-            elif "period" in df_copy.index.names:
-                # For multi-invest, keep first period's timesteps as base
-                first_period = df_copy.index.get_level_values(0)[0]
-                df_copy = df_copy.xs(first_period, level=0)
-        
-        df_copy.columns = [f"{component_prefix}-{attr}-{c}" for c in df_copy.columns]
-        return df_copy
+    leap_days = weightings.index[
+        (weightings.index.month == 2) & (weightings.index.day == 29)
+    ]
+    if leap_days.empty:
+        return weightings
 
-    if include_generators:
-        # Generator availability profiles
-        gen_pu = _get_dynamic_data(n.generators_t.p_max_pu, "Generator", "p_max_pu")
-        if gen_pu is not None:
-            dfs.append(gen_pu)
+    weightings = weightings.copy()
+    for year in leap_days.year.unique():
+        march_first_candidates = weightings.index[
+            (weightings.index.year == year)
+            & (weightings.index.month == 3)
+            & (weightings.index.day == 1)
+        ]
+        if len(march_first_candidates) > 0:
+            march_first = march_first_candidates[0]
+            leap_mask = (
+                (weightings.index.year == year)
+                & (weightings.index.month == 2)
+                & (weightings.index.day == 29)
+            )
+            weightings.loc[march_first] += weightings.loc[leap_mask].sum()
 
-        # Generator marginal costs (if time-varying)
-        gen_mc = _get_dynamic_data(n.generators_t.marginal_cost, "Generator", "marginal_cost")
-        if gen_mc is not None:
-            dfs.append(gen_mc)
-
-    if include_loads:
-        # Load profiles
-        load_p = _get_dynamic_data(n.loads_t.p_set, "Load", "p_set")
-        if load_p is not None:
-            dfs.append(load_p)
-
-    if include_storage_units:
-        # Storage unit inflow
-        su_inflow = _get_dynamic_data(n.storage_units_t.inflow, "StorageUnit", "inflow")
-        if su_inflow is not None:
-            dfs.append(su_inflow)
-
-    if include_stores:
-        # Store inflow
-        st_e = _get_dynamic_data(n.stores_t.e_set, "Store", "e_set")
-        if st_e is not None:
-            dfs.append(st_e)
-
-    if include_links:
-        # Link efficiency profiles
-        link_eff = _get_dynamic_data(n.links_t.efficiency, "Link", "efficiency")
-        if link_eff is not None:
-            dfs.append(link_eff)
-
-        # Link availability profiles
-        link_pu = _get_dynamic_data(n.links_t.p_max_pu, "Link", "p_max_pu")
-        if link_pu is not None:
-            dfs.append(link_pu)
-
-    # Add custom columns
-    if custom_columns:
-        for name, series in custom_columns.items():
-            if isinstance(series, pd.Series):
-                dfs.append(series.to_frame(name))
-            elif isinstance(series, pd.DataFrame):
-                series.columns = [f"{name}-{c}" for c in series.columns]
-                dfs.append(series)
-
-    if not dfs:
-        raise ValueError(
-            "No time series data found in the network. "
-            "Ensure the network has time-varying data before clustering."
-        )
-
-    # Combine all time series
-    combined = pd.concat(dfs, axis=1)
-
-    # Ensure datetime index
-    if not isinstance(combined.index, pd.DatetimeIndex):
-        logger.warning(
-            "Snapshot index is not DatetimeIndex. "
-            "Creating synthetic datetime index for tsam."
-        )
-        combined.index = pd.date_range(
-            start="2020-01-01", periods=len(combined), freq="h"
-        )
-
-    return combined
+    return weightings.drop(leap_days).sort_index()
 
 
-def _apply_typical_periods_to_network(
-    n: "Network",
-    aggregation: Any,  # tsam.TimeSeriesAggregation
-    typical_periods: pd.DataFrame,
-) -> "Network":
-    """Apply the typical periods to create a new reduced network.
+def _build_resample_map(
+    original_snapshots: pd.Index,
+    resampled_snapshots: pd.Index,
+    offset: str,
+) -> pd.Series:
+    """Build mapping from original to resampled snapshots.
 
     Parameters
     ----------
-    n : Network
-        Original network.
-    aggregation : tsam.TimeSeriesAggregation
-        The tsam aggregation object.
-    typical_periods : pd.DataFrame
-        The typical periods.
+    original_snapshots : pd.Index
+        Original snapshot index.
+    resampled_snapshots : pd.Index
+        Resampled snapshot index.
+    offset : str
+        Pandas offset string used for resampling.
 
     Returns
     -------
-    Network
-        New network with reduced snapshots.
+    pd.Series
+        Mapping from original to resampled snapshots.
+
     """
-    import pypsa
-
-    # Get clustering information
-    period_weights = pd.Series(aggregation.clusterPeriodNoOccur)
-
-    # Store original network info
-    has_scenarios = n.has_scenarios
-    has_investment_periods = len(n.investment_periods) > 0
-    original_scenarios = n.scenarios if has_scenarios else None
-    original_scenario_weightings = n._scenarios_data.copy() if has_scenarios else None
-    original_investment_periods = n.investment_periods.copy() if has_investment_periods else None
-    original_investment_weightings = n.investment_period_weightings.copy() if has_investment_periods else None
-
-    # Create new network - start fresh to avoid issues with complex indices
-    n_clustered = pypsa.Network()
-    
-    # Copy meta information
-    n_clustered.name = n.name
-
-    # Create new snapshot index
-    n_periods = len(period_weights)
-    hours_per_period = aggregation.hoursPerPeriod
-
-    if aggregation.segmentation:
-        # With segmentation: variable number of time steps per period
-        new_snapshots = []
-        snapshot_weightings_list = []
-
-        for period_idx in range(n_periods):
-            segment_durations = aggregation.segmentDurationDict.get(period_idx, {})
-            n_segments = len(segment_durations) if segment_durations else hours_per_period
-
-            for seg_idx in range(n_segments):
-                # Create snapshot label
-                snapshot_label = f"period_{period_idx}_seg_{seg_idx}"
-                new_snapshots.append(snapshot_label)
-
-                # Calculate weighting: period occurrences * segment duration
-                period_occur = period_weights.get(period_idx, 1)
-                seg_duration = segment_durations.get(seg_idx, 1)
-                snapshot_weightings_list.append(period_occur * seg_duration)
-
-        new_index = pd.Index(new_snapshots, name="snapshot")
-        weightings = pd.Series(snapshot_weightings_list, index=new_index)
-    else:
-        # Without segmentation: regular structure
-        new_snapshots = []
-        snapshot_weightings_list = []
-
-        for period_idx in range(n_periods):
-            for hour in range(hours_per_period):
-                snapshot_label = f"period_{period_idx}_hour_{hour}"
-                new_snapshots.append(snapshot_label)
-                snapshot_weightings_list.append(period_weights.get(period_idx, 1))
-
-        new_index = pd.Index(new_snapshots, name="snapshot")
-        weightings = pd.Series(snapshot_weightings_list, index=new_index)
-
-    # Handle Multi-Investment-Periods: Create MultiIndex (period, timestep)
-    if has_investment_periods and original_investment_periods is not None:
-        # For multi-invest, we need to replicate typical periods for each investment period
-        # and create a proper MultiIndex
-        multi_snapshots = []
-        multi_weightings = []
-        
-        for inv_period in original_investment_periods:
-            for snap, weight in zip(new_snapshots, snapshot_weightings_list):
-                multi_snapshots.append((inv_period, snap))
-                # Weight includes investment period weighting
-                inv_weight = original_investment_weightings.get(inv_period, 1.0)
-                multi_weightings.append(weight)  # tsam weights only, inv weights applied separately
-        
-        new_index = pd.MultiIndex.from_tuples(
-            multi_snapshots, 
-            names=["period", "timestep"]
-        )
-        weightings = pd.Series(multi_weightings, index=new_index)
-        
-        # Also need to expand typical_periods for each investment period
-        expanded_typical = pd.DataFrame()
-        for inv_period in original_investment_periods:
-            period_df = typical_periods.copy()
-            period_df.index = pd.MultiIndex.from_tuples(
-                [(inv_period, f"period_{i // hours_per_period}_hour_{i % hours_per_period}") 
-                 for i in range(len(period_df))],
-                names=["period", "timestep"]
-            )
-            expanded_typical = pd.concat([expanded_typical, period_df])
-        typical_periods = expanded_typical
-
-    # Set new snapshots
-    n_clustered.set_snapshots(new_index)
-    
-    # Set snapshot weightings
-    n_clustered.snapshot_weightings.loc[:, "objective"] = weightings.values
-    n_clustered.snapshot_weightings.loc[:, "generators"] = weightings.values
-    n_clustered.snapshot_weightings.loc[:, "stores"] = weightings.values
-
-    # Copy all static components
-    _copy_static_components(n, n_clustered, has_scenarios)
-    
-    # Apply typical periods to time-varying data
-    _apply_time_series_to_clustered_network(
-        n, n_clustered, typical_periods, aggregation, has_scenarios
-    )
-
-    # Restore investment periods if they existed
-    if has_investment_periods and original_investment_periods is not None:
-        n_clustered._investment_periods = original_investment_periods
-        n_clustered._investment_period_weightings = original_investment_weightings
-        # Mark as multi-invest network
-        n_clustered._multi_invest = True
-
-    # Restore scenarios if they existed
-    if has_scenarios and original_scenarios is not None:
-        # Replicate static data for each scenario
-        for c in n_clustered.components.values():
-            if not c.static.empty:
-                c.static = pd.concat(
-                    dict.fromkeys(original_scenarios, c.static), names=["scenario"]
-                )
-            else:
-                # For empty DataFrames, create proper MultiIndex
-                # to match the scenario structure
-                empty_idx = pd.MultiIndex.from_tuples(
-                    [], names=["scenario", "name"]
-                )
-                c.static = c.static.reindex(empty_idx)
-            
-            for k, v in c.dynamic.items():
-                if not v.empty:
-                    c.dynamic[k] = pd.concat(
-                        dict.fromkeys(original_scenarios, v), names=["scenario"], axis=1
-                    )
-                else:
-                    # For empty DataFrames, create proper MultiIndex columns
-                    # to match the scenario structure
-                    empty_cols = pd.MultiIndex.from_tuples(
-                        [], names=["scenario", "name"]
-                    )
-                    c.dynamic[k] = pd.DataFrame(index=new_index, columns=empty_cols)
-        n_clustered._scenarios_data = original_scenario_weightings
-
-    logger.info(
-        f"Created clustered network with {len(new_index)} snapshots "
-        f"(reduced from {len(n.snapshots)})"
-    )
-
-    return n_clustered
+    if isinstance(original_snapshots, pd.DatetimeIndex):
+        resampled_dt = pd.DatetimeIndex(resampled_snapshots)
+        idx = np.searchsorted(resampled_dt, original_snapshots, side="right") - 1
+        idx = np.clip(idx, 0, len(resampled_dt) - 1)
+        mapped_index = pd.DatetimeIndex(resampled_dt[idx])
+        return pd.Series(mapped_index, index=original_snapshots)
+    return pd.Series(resampled_snapshots[0], index=original_snapshots)
 
 
-def _copy_static_components(
-    n_source: "Network", 
-    n_target: "Network",
-    has_scenarios: bool,
-) -> None:
-    """Copy all static components from source to target network.
-    
-    Parameters
-    ----------
-    n_source : Network
-        Source network to copy from.
-    n_target : Network
-        Target network to copy to.
-    has_scenarios : bool
-        Whether the source network has scenarios.
-    """
-    # List of component types to copy
-    component_types = [
-        ("Bus", "buses"),
-        ("Carrier", "carriers"),
-        ("Generator", "generators"),
-        ("Load", "loads"),
-        ("StorageUnit", "storage_units"),
-        ("Store", "stores"),
-        ("Line", "lines"),
-        ("Link", "links"),
-        ("Transformer", "transformers"),
-        ("ShuntImpedance", "shunt_impedances"),
-    ]
-    
-    for component_name, attr_name in component_types:
-        source_df = getattr(n_source, attr_name)
-        if source_df.empty:
-            continue
-            
-        # Handle MultiIndex for stochastic networks
-        if has_scenarios and isinstance(source_df.index, pd.MultiIndex):
-            # Get first scenario's data as reference
-            first_scenario = source_df.index.get_level_values(0)[0]
-            source_df = source_df.xs(first_scenario, level=0)
-        
-        # Add components one by one
-        for idx in source_df.index:
-            row = source_df.loc[idx]
-            kwargs = row.dropna().to_dict()
-            
-            # Remove internal columns
-            for col in ["_i", "sub_network"]:
-                kwargs.pop(col, None)
-            
-            try:
-                n_target.add(component_name, idx, **kwargs)
-            except Exception as e:
-                logger.debug(f"Could not add {component_name} {idx}: {e}")
-
-
-def _apply_time_series_to_clustered_network(
-    n_source: "Network",
-    n_target: "Network",
-    typical_periods: pd.DataFrame,
-    aggregation: Any,
-    has_scenarios: bool,
-) -> None:
-    """Apply the typical period time series to the clustered network.
-
-    Parameters
-    ----------
-    n_source : Network
-        Original network (for reference).
-    n_target : Network
-        The clustered network to update (modified in-place).
-    typical_periods : pd.DataFrame
-        The typical periods data.
-    aggregation : tsam.TimeSeriesAggregation
-        The aggregation object.
-    has_scenarios : bool
-        Whether the source network has scenarios.
-    """
-    scenarios = list(n_source.scenarios) if has_scenarios else [None]
-    
-    # Map column names back to component attributes
-    for col in typical_periods.columns:
-        parts = col.split("-", 2)
-        if len(parts) != 3:
-            continue
-
-        component, attr, name = parts
-        component_lower = component.lower()
-        
-        # Handle plural forms
-        if component_lower == "storageunit":
-            component_attr = "storage_units_t"
-        else:
-            component_attr = f"{component_lower}s_t"
-
-        # Get the component's dynamic attribute DataFrame
-        try:
-            component_t = getattr(n_target, component_attr)
-            if hasattr(component_t, attr):
-                df = getattr(component_t, attr)
-                
-                # Assign the typical period values
-                values = typical_periods[col].values
-                if len(values) == len(n_target.snapshots):
-                    if has_scenarios:
-                        # For stochastic networks, apply to all scenarios
-                        for scenario in scenarios:
-                            if isinstance(df.columns, pd.MultiIndex):
-                                df[(scenario, name)] = values
-                            else:
-                                df[name] = values
-                    else:
-                        df[name] = values
-        except (AttributeError, KeyError) as e:
-            logger.debug(f"Could not apply {col} to network: {e}")
-            continue
-
-
-def cluster_temporally(
-    n: "Network",
-    n_typical_periods: int = 10,
-    hours_per_period: int = 24,
-    n_segments: int | None = None,
-    cluster_method: ClusterMethod = "hierarchical",
-    representation_method: RepresentationMethod | None = None,
-    extreme_period_method: ExtremePeriodMethod = "None",
-    rescale_cluster_periods: bool = True,
-    weight_dict: dict[str, float] | None = None,
-    add_peak_min: list[str] | None = None,
-    add_peak_max: list[str] | None = None,
-    include_generators: bool = True,
-    include_loads: bool = True,
-    include_storage_units: bool = True,
-    include_stores: bool = True,
-    include_links: bool = True,
-    custom_time_series: dict[str, pd.Series] | None = None,
-    solver: str = "highs",
+def _resample_with_periods(
+    n: Network,
+    offset: str,
+    *,
+    drop_leap_day: bool = False,
+    aggregation_rules: dict[str, str] | None = None,
 ) -> TemporalClustering:
-    """Cluster network snapshots to typical periods using tsam.
+    """Resample network with investment periods, clustering within each period."""
+    m = n.copy()
+    original_snapshots = n.snapshots
 
-    This function reduces the temporal complexity of a PyPSA network by
-    aggregating similar time periods into representative typical periods.
-    This is particularly useful for long-term energy system optimization
-    where full hourly resolution is computationally prohibitive.
+    resampled_weightings_list = []
+    for period in n.periods:
+        period_mask = n.snapshots.get_level_values("period") == period
+        sws_period = n.snapshot_weightings[period_mask]
+        timesteps = sws_period.index.get_level_values("timestep")
+        sws_flat = pd.DataFrame(
+            sws_period.values,
+            index=pd.DatetimeIndex(timesteps),
+            columns=sws_period.columns,
+        )
+        sws_resampled = sws_flat.resample(offset).sum()
+        sws_resampled = sws_resampled.query("objective != 0")
+        if drop_leap_day:
+            sws_resampled = _handle_leap_day(sws_resampled)
+        sws_resampled.index = pd.MultiIndex.from_product(
+            [[period], sws_resampled.index], names=["period", "timestep"]
+        )
+        sws_resampled.index.name = "snapshot"
+        resampled_weightings_list.append(sws_resampled)
+
+    snapshot_weightings = pd.concat(resampled_weightings_list)
+    m.set_snapshots(snapshot_weightings.index)
+    m.snapshot_weightings = snapshot_weightings
+
+    for c in n.components:
+        if c.static.empty:
+            continue
+        for attr, df in c.dynamic.items():
+            if df.empty:
+                continue
+            agg = _get_aggregation_rule(attr, aggregation_rules)
+            resampled_list = []
+            for period in n.periods:
+                period_mask = df.index.get_level_values("period") == period
+                df_period = df[period_mask]
+                timesteps = df_period.index.get_level_values("timestep")
+                df_flat = pd.DataFrame(
+                    df_period.values,
+                    index=pd.DatetimeIndex(timesteps),
+                    columns=df_period.columns,
+                )
+                resampled = df_flat.resample(offset).agg(agg)
+                resampled = resampled.query(
+                    "index in @snapshot_weightings.index.get_level_values('timestep').unique()"
+                )
+                resampled.index = pd.MultiIndex.from_product(
+                    [[period], resampled.index], names=["period", "timestep"]
+                )
+                resampled.index.name = "snapshot"
+                resampled_list.append(resampled)
+            resampled_all = pd.concat(resampled_list)
+            m._import_series_from_df(resampled_all, c.name, attr, overwrite=True)
+
+    snapshot_map = pd.Series(index=original_snapshots, dtype=object)
+    for period in n.periods:
+        orig_mask = original_snapshots.get_level_values("period") == period
+        new_mask = m.snapshots.get_level_values("period") == period
+        orig_timesteps = original_snapshots[orig_mask].get_level_values("timestep")
+        new_timesteps = m.snapshots[new_mask].get_level_values("timestep")
+        period_map = _build_resample_map(
+            pd.DatetimeIndex(orig_timesteps),
+            pd.DatetimeIndex(new_timesteps),
+            offset,
+        )
+        for orig, new in zip(
+            original_snapshots[orig_mask],
+            [(period, ts) for ts in period_map.values],
+            strict=False,
+        ):
+            snapshot_map[orig] = new
+
+    return TemporalClustering(m, snapshot_map)
+
+
+def _downsample_with_periods(n: Network, stride: int) -> TemporalClustering:
+    """Downsample network with investment periods, selecting within each period."""
+    m = n.copy()
+    original_snapshots = n.snapshots
+
+    downsampled_weightings_list = []
+    selected_snapshots_list = []
+
+    for period in n.periods:
+        period_mask = n.snapshots.get_level_values("period") == period
+        period_snapshots = n.snapshots[period_mask]
+        period_weightings = n.snapshot_weightings[period_mask]
+
+        # Select every Nth snapshot within this period
+        selected_idx = range(0, len(period_snapshots), stride)
+        selected = period_snapshots[list(selected_idx)]
+        selected_snapshots_list.append(selected)
+
+        # Scale weightings, handle remainder for last snapshot
+        remainder = len(period_snapshots) % stride
+        new_weights = period_weightings.loc[selected].copy()
+        new_weights *= stride
+        if remainder != 0:
+            new_weights.iloc[-1] = new_weights.iloc[-1] / stride * remainder
+        downsampled_weightings_list.append(new_weights)
+
+    all_selected = pd.MultiIndex.from_tuples(
+        [s for idx in selected_snapshots_list for s in idx],
+        names=["period", "timestep"],
+    )
+    snapshot_weightings = pd.concat(downsampled_weightings_list)
+
+    m.set_snapshots(all_selected)
+    m.snapshot_weightings = snapshot_weightings
+
+    for c in n.components:
+        if c.static.empty:
+            continue
+        for attr, df in c.dynamic.items():
+            if df.empty:
+                continue
+            m._import_series_from_df(df.loc[all_selected], c.name, attr, overwrite=True)
+
+    # Build snapshot map using vectorized assignment per period
+    snapshot_map = pd.Series(index=original_snapshots, dtype=object)
+    for period in n.periods:
+        period_mask = original_snapshots.get_level_values("period") == period
+        period_snapshots = original_snapshots[period_mask]
+        new_mask = all_selected.get_level_values("period") == period
+        period_selected = all_selected[new_mask]
+
+        # Vectorized: assign each original snapshot to its representative
+        num_period = len(period_snapshots)
+        indices = np.arange(num_period) // stride
+        indices = np.clip(indices, 0, len(period_selected) - 1)
+        snapshot_map.loc[period_snapshots] = [period_selected[i] for i in indices]
+
+    return TemporalClustering(m, snapshot_map)
+
+
+class TemporalClusteringMixin:
+    """Mixin for temporal clustering methods.
+
+    Class inherits to [`pypsa.clustering.TemporalClusteringAccessor`][]. All methods
+    available via `n.cluster.temporal`.
+    """
+
+    _n: Network
+
+    def resample(
+        self,
+        offset: str,
+        *,
+        drop_leap_day: bool = False,
+        aggregation_rules: dict[str, str] | None = None,
+    ) -> Network:
+        """Resample network to coarser temporal resolution.
+
+        Parameters
+        ----------
+        offset : str
+            Pandas offset string (e.g., "3h", "6h", "24h").
+        drop_leap_day : bool, default False
+            Transfer Feb 29 weights to March 1.
+        aggregation_rules : dict, optional
+            Override default aggregation per attribute.
+
+        Returns
+        -------
+        Network
+            The resampled network.
+
+        Note
+        ----
+        This is not an inplace operation. Returns a new network.
+
+        Examples
+        --------
+        >>> m = n.cluster.temporal.resample("3h")  # doctest: +SKIP
+
+        """
+        return self.get_resample_result(
+            offset,
+            drop_leap_day=drop_leap_day,
+            aggregation_rules=aggregation_rules,
+        ).n
+
+    def get_resample_result(
+        self,
+        offset: str,
+        *,
+        drop_leap_day: bool = False,
+        aggregation_rules: dict[str, str] | None = None,
+    ) -> TemporalClustering:
+        """Get full TemporalClustering result from resample.
+
+        Returns the full result including both the clustered network and the
+        snapshot mapping. Use this when you need the snapshot_map for
+        disaggregation or debugging.
+
+        Parameters
+        ----------
+        offset : str
+            Pandas offset string (e.g., "3h", "6h", "24h").
+        drop_leap_day : bool, default False
+            Transfer Feb 29 weights to March 1.
+        aggregation_rules : dict, optional
+            Override default aggregation per attribute.
+
+        Returns
+        -------
+        TemporalClustering
+            Result with clustered network and snapshot mapping.
+
+        """
+        n = self._n
+        _warn_if_solved(n)
+        _check_no_scenarios(n)
+
+        if not isinstance(n.snapshots, pd.DatetimeIndex) and not n.has_periods:
+            msg = "resample() requires snapshots to be a DatetimeIndex"
+            raise TypeError(msg)
+
+        if n.has_periods:
+            return _resample_with_periods(
+                n,
+                offset,
+                drop_leap_day=drop_leap_day,
+                aggregation_rules=aggregation_rules,
+            )
+
+        m = n.copy()
+
+        original_snapshots = n.snapshots
+
+        # Year-wise resampling handles non-contiguous years gracefully
+        years = pd.DatetimeIndex(n.snapshots).year.unique()
+        snapshot_weightings_list = []
+        for year in years:
+            year_mask = n.snapshots.year == year
+            sws_year = n.snapshot_weightings[year_mask]
+            sws_year = sws_year.resample(offset).sum()
+            snapshot_weightings_list.append(sws_year)
+        snapshot_weightings = pd.concat(snapshot_weightings_list)
+
+        # The resampling produces a contiguous date range. In case the original
+        # index was not contiguous, all rows with zero weight must be dropped
+        # (corresponding to time steps not included in the original snapshots).
+        snapshot_weightings = snapshot_weightings.query("objective != 0")
+
+        if drop_leap_day:
+            snapshot_weightings = _handle_leap_day(snapshot_weightings)
+
+        m.set_snapshots(snapshot_weightings.index)
+        m.snapshot_weightings = snapshot_weightings
+
+        for c in n.components:
+            if c.static.empty:
+                continue
+            for attr, df in c.dynamic.items():
+                if df.empty:
+                    continue
+                agg = _get_aggregation_rule(attr, aggregation_rules)
+                resampled_list = []
+                for year in years:
+                    year_mask = n.snapshots.year == year
+                    df_year = df[year_mask]
+                    resampled_year = df_year.resample(offset).agg(agg)
+                    resampled_list.append(resampled_year)
+                resampled = pd.concat(resampled_list)
+                resampled = resampled[resampled.index.isin(m.snapshots)]
+                m._import_series_from_df(resampled, c.name, attr, overwrite=True)
+
+        snapshot_map = _build_resample_map(original_snapshots, m.snapshots, offset)
+
+        return TemporalClustering(m, snapshot_map)
+
+    def downsample(
+        self,
+        stride: int,
+    ) -> Network:
+        """Select every Nth snapshot as representative.
+
+        Weightings are scaled by stride to preserve total modeled hours.
+
+        Parameters
+        ----------
+        stride : int
+            Select every stride-th snapshot.
+
+        Returns
+        -------
+        Network
+            The downsampled network.
+
+        Examples
+        --------
+        >>> m = n.cluster.temporal.downsample(4)  # doctest: +SKIP
+
+        """
+        return self.get_downsample_result(stride).n
+
+    def get_downsample_result(
+        self,
+        stride: int,
+    ) -> TemporalClustering:
+        """Get full TemporalClustering result from downsample.
+
+        Returns the full result including both the clustered network and the
+        snapshot mapping.
+
+        Parameters
+        ----------
+        stride : int
+            Select every stride-th snapshot.
+
+        Returns
+        -------
+        TemporalClustering
+            Result with downsampled network and snapshot mapping.
+
+        """
+        n = self._n
+        _warn_if_solved(n)
+        _check_no_scenarios(n)
+
+        if stride < 1:
+            msg = f"stride must be >= 1, got {stride}"
+            raise ValueError(msg)
+
+        if n.has_periods:
+            return _downsample_with_periods(n, stride)
+
+        m = n.copy()
+        original_snapshots = n.snapshots
+
+        selected = n.snapshots[::stride]
+        m.set_snapshots(selected)
+
+        num_orig = len(original_snapshots)
+        remainder = num_orig % stride
+
+        new_weightings = n.snapshot_weightings.loc[selected].copy()
+        new_weightings *= stride
+        if remainder != 0:
+            new_weightings.iloc[-1] = new_weightings.iloc[-1] / stride * remainder
+        m.snapshot_weightings = new_weightings
+
+        for c in n.components:
+            if c.static.empty:
+                continue
+            for attr, df in c.dynamic.items():
+                if df.empty:
+                    continue
+                m._import_series_from_df(df.loc[selected], c.name, attr, overwrite=True)
+
+        snapshot_map = pd.Series(index=original_snapshots, dtype=object)
+        for i, sel in enumerate(selected):
+            start = i * stride
+            end = min((i + 1) * stride, num_orig)
+            snapshot_map.iloc[start:end] = sel
+
+        return TemporalClustering(m, snapshot_map)
+
+    def segment(
+        self,
+        num_segments: int,
+        *,
+        solver: str = "highs",
+        exclude_attrs: list[str] | None = None,
+        aggregation_rules: dict[str, str] | None = None,
+    ) -> Network:
+        """Cluster time series into variable-duration segments using TSAM.
+
+        Parameters
+        ----------
+        num_segments : int
+            Target number of segments.
+        solver : str, default "highs"
+            MIP solver for time clustering.
+        exclude_attrs : list, optional
+            Attributes to exclude from clustering (default: ["e_min_pu"]).
+        aggregation_rules : dict, optional
+            Override default aggregation per attribute.
+
+        Returns
+        -------
+        Network
+            The segmented network.
+
+        Note
+        ----
+        Requires `tsam` package: pip install tsam
+
+        """
+        return self.get_segment_result(
+            num_segments,
+            solver=solver,
+            exclude_attrs=exclude_attrs,
+            aggregation_rules=aggregation_rules,
+        ).n
+
+    def get_segment_result(
+        self,
+        num_segments: int,
+        *,
+        solver: str = "highs",
+        exclude_attrs: list[str] | None = None,
+        aggregation_rules: dict[str, str] | None = None,
+    ) -> TemporalClustering:
+        """Get full TemporalClustering result from segment.
+
+        Returns the full result including both the clustered network and the
+        snapshot mapping.
+
+        Parameters
+        ----------
+        num_segments : int
+            Target number of segments.
+        solver : str, default "highs"
+            MIP solver for time clustering.
+        exclude_attrs : list, optional
+            Attributes to exclude from clustering (default: ["e_min_pu"]).
+        aggregation_rules : dict, optional
+            Override default aggregation per attribute.
+
+        Returns
+        -------
+        TemporalClustering
+            Result with segmented network and snapshot mapping.
+
+        """
+        n = self._n
+        _warn_if_solved(n)
+        _check_no_scenarios(n)
+
+        if num_segments < 1:
+            msg = f"num_segments must be >= 1, got {num_segments}"
+            raise ValueError(msg)
+
+        if num_segments > len(n.snapshots):
+            msg = f"num_segments ({num_segments}) cannot exceed number of snapshots ({len(n.snapshots)})"
+            raise ValueError(msg)
+
+        if find_spec("tsam") is None:
+            msg = (
+                "Optional dependency 'tsam' not found. "
+                "Install via 'pip install tsam' or 'conda install -c conda-forge tsam'"
+            )
+            raise ModuleNotFoundError(msg)
+
+        import tsam  # noqa: PLC0415
+
+        if exclude_attrs is None:
+            exclude_attrs = ["e_min_pu"]
+
+        if n.has_periods:
+            msg = "segment() does not yet support networks with investment periods"
+            raise NotImplementedError(msg)
+
+        dfs = []
+        col_attrs = []
+        for c in n.components:
+            if c.static.empty:
+                continue
+            for attr, df in c.dynamic.items():
+                if not df.empty and attr not in exclude_attrs:
+                    for col in df.columns:
+                        dfs.append(df[[col]])
+                        col_attrs.append((c.name, attr, col))
+
+        if not dfs:
+            msg = "No time-varying data found for segmentation"
+            raise ValueError(msg)
+
+        combined = pd.concat(dfs, axis=1)
+        combined.columns = range(len(combined.columns))
+
+        normalization_factors = combined.max().replace(0, 1)
+        df_normalized = combined.div(normalization_factors)
+        df_normalized = df_normalized.fillna(0)
+
+        if hasattr(tsam, "aggregate"):  # tsam >= 3.0
+            result = tsam.aggregate(
+                df_normalized,
+                n_clusters=1,
+                period_duration=len(df_normalized),
+                segments=tsam.SegmentConfig(n_segments=num_segments),
+            )
+            segmented = result.cluster_representatives
+        else:  # tsam < 3.0
+            import tsam.timeseriesaggregation  # noqa: PLC0415
+
+            agg = tsam.timeseriesaggregation.TimeSeriesAggregation(
+                df_normalized,
+                hoursPerPeriod=len(df_normalized),
+                noTypicalPeriods=1,
+                noSegments=num_segments,
+                segmentation=True,
+                solver=solver,
+            )
+            segmented = agg.createTypicalPeriods()
+
+        weightings_raw = segmented.index.get_level_values("Segment Duration")
+        offsets = np.insert(np.cumsum(weightings_raw.values[:-1]), 0, 0).astype(int)
+        original_snapshots = n.snapshots
+
+        if isinstance(original_snapshots, pd.DatetimeIndex):
+            new_snapshots = original_snapshots[offsets]
+        else:
+            new_snapshots = pd.Index(offsets)
+
+        m = n.copy()
+        m.set_snapshots(new_snapshots)
+
+        new_weightings = pd.DataFrame(
+            dict.fromkeys(n.snapshot_weightings.columns, weightings_raw.values),
+            index=new_snapshots,
+        )
+        m.snapshot_weightings = new_weightings
+
+        segmented_values = segmented.values * normalization_factors.values
+        segmented_df = pd.DataFrame(
+            segmented_values,
+            index=new_snapshots,
+            columns=range(len(col_attrs)),
+        )
+
+        for i, (comp, attr, col_name) in enumerate(col_attrs):
+            data_col = segmented_df[[i]]
+            data_col.columns = [col_name]
+            if attr in m.c[comp].dynamic and not m.c[comp].dynamic[attr].empty:
+                m.c[comp].dynamic[attr][col_name] = data_col[col_name]
+            else:
+                m._import_series_from_df(data_col, comp, attr, overwrite=True)
+
+        segment_indices = (
+            np.searchsorted(offsets, np.arange(len(original_snapshots)), side="right")
+            - 1
+        )
+        snapshot_map = pd.Series(
+            np.asarray(new_snapshots)[segment_indices], index=original_snapshots
+        )
+
+        return TemporalClustering(m, snapshot_map)
+
+    def from_snapshot_map(
+        self,
+        snapshot_map: pd.Series | pd.DataFrame,
+        *,
+        aggregation_rules: dict[str, str] | None = None,
+    ) -> Network:
+        """Apply pre-computed temporal aggregation mapping.
+
+        Parameters
+        ----------
+        snapshot_map : pd.Series or pd.DataFrame
+            Mapping from original snapshots to aggregated snapshots.
+            If DataFrame, must have 'snapshot' index and columns for weightings.
+        aggregation_rules : dict, optional
+            Override default aggregation per attribute.
+
+        Returns
+        -------
+        Network
+            The aggregated network.
+
+        """
+        return self.get_from_snapshot_map_result(
+            snapshot_map, aggregation_rules=aggregation_rules
+        ).n
+
+    def get_from_snapshot_map_result(
+        self,
+        snapshot_map: pd.Series | pd.DataFrame,
+        *,
+        aggregation_rules: dict[str, str] | None = None,
+    ) -> TemporalClustering:
+        """Get full TemporalClustering result from from_snapshot_map.
+
+        Returns the full result including both the clustered network and the
+        snapshot mapping.
+
+        Parameters
+        ----------
+        snapshot_map : pd.Series or pd.DataFrame
+            Mapping from original snapshots to aggregated snapshots.
+            If DataFrame, must have 'snapshot' index and columns for weightings.
+        aggregation_rules : dict, optional
+            Override default aggregation per attribute.
+
+        Returns
+        -------
+        TemporalClustering
+            Result with aggregated network and snapshot mapping.
+
+        """
+        n = self._n
+        _warn_if_solved(n)
+        _check_no_scenarios(n)
+
+        if isinstance(snapshot_map, pd.DataFrame):
+            snapshot_map_series = snapshot_map.iloc[:, 0]
+        else:
+            snapshot_map_series = snapshot_map
+
+        if not snapshot_map_series.index.equals(n.snapshots):
+            msg = "snapshot_map index must match network snapshots"
+            raise ValueError(msg)
+
+        aggregated_snapshots = snapshot_map_series.unique()
+        aggregated_snapshots = pd.Index(sorted(aggregated_snapshots))
+
+        weightings = n.snapshot_weightings.groupby(snapshot_map_series).sum()
+        weightings = weightings.reindex(aggregated_snapshots)
+
+        m = n.copy()
+        m.set_snapshots(aggregated_snapshots)
+        m.snapshot_weightings = weightings
+
+        for c in n.components:
+            if c.static.empty:
+                continue
+            for attr, df in c.dynamic.items():
+                if df.empty:
+                    continue
+                agg = _get_aggregation_rule(attr, aggregation_rules)
+                aggregated = df.groupby(snapshot_map_series).agg(agg)
+                aggregated = aggregated.reindex(aggregated_snapshots)
+                m._import_series_from_df(aggregated, c.name, attr, overwrite=True)
+
+        return TemporalClustering(m, snapshot_map_series)
+
+
+# Backward-compatible module-level functions
+
+
+def resample(
+    n: Network,
+    offset: str,
+    *,
+    drop_leap_day: bool = False,
+    aggregation_rules: dict[str, str] | None = None,
+) -> TemporalClustering:
+    """Resample network to coarser temporal resolution.
 
     Parameters
     ----------
     n : Network
-        The PyPSA network to cluster.
-    n_typical_periods : int, default 10
-        Number of typical periods to create. More periods increase accuracy
-        but also computational cost.
-    hours_per_period : int, default 24
-        Length of each period in hours. Common values are 24 (daily),
-        168 (weekly), or 8760 (yearly).
-
-        **Important for storage modeling**: The ``hours_per_period`` parameter
-        significantly affects storage accuracy. With ``e_cyclic=True``, storages
-        must return to their initial state at the end of **each typical period**.
-        This means:
-
-        - **Daily periods (24h)**: Only intra-day storage cycles are captured.
-          Multi-day storage patterns are lost, often leading to significant
-          over- or underestimation of storage capacity (up to +300% error).
-        - **Weekly periods (168h)**: Preserves multi-day and weekend patterns.
-          Recommended for thermal storage, batteries with multi-day cycles.
-        - **Longer periods**: Better for seasonal storage, but less complexity
-          reduction.
-
-        Rule of thumb: Set ``hours_per_period`` to match or exceed the typical
-        storage cycle duration in your system.
-    n_segments : int, optional
-        Number of segments within each period. If None, no segmentation
-        is applied. Segmentation further reduces complexity by merging
-        similar consecutive hours within periods.
-    cluster_method : str, default "hierarchical"
-        Clustering algorithm. Options:
-        - "averaging": Simple averaging
-        - "k_means": K-means clustering
-        - "k_medoids": K-medoids clustering (exact, uses solver)
-        - "k_maxoids": K-maxoids clustering
-        - "hierarchical": Hierarchical agglomerative clustering
-        - "adjacent_periods": Cluster only adjacent periods
-    representation_method : str, optional
-        How to represent each cluster. If None, uses default for cluster_method.
-        Options: "meanRepresentation", "medoidRepresentation",
-        "minmaxmeanRepresentation", "durationRepresentation",
-        "distributionRepresentation", "distributionAndMinMaxRepresentation"
-    extreme_period_method : str, default "None"
-        How to handle extreme periods (peak demand, etc.).
-        Options: "None", "append", "new_cluster_center", "replace_cluster_center"
-    rescale_cluster_periods : bool, default True
-        Whether to rescale periods to preserve mean values.
-    weight_dict : dict, optional
-        Weights for different time series during clustering.
-        Keys are column names, values are weights.
-    add_peak_min : list, optional
-        Time series columns for which to add the period with minimum peak.
-    add_peak_max : list, optional
-        Time series columns for which to add the period with maximum peak.
-    include_generators : bool, default True
-        Include generator time series in clustering.
-    include_loads : bool, default True
-        Include load time series in clustering.
-    include_storage_units : bool, default True
-        Include storage unit time series in clustering.
-    include_stores : bool, default True
-        Include store time series in clustering.
-    include_links : bool, default True
-        Include link time series in clustering.
-    custom_time_series : dict, optional
-        Additional custom time series to include.
-    solver : str, default "highs"
-        Solver for k_medoids clustering.
+        Network with original resolution.
+    offset : str
+        Pandas offset string (e.g., "3h", "6h", "24h").
+    drop_leap_day : bool, default False
+        Transfer Feb 29 weights to March 1.
+    aggregation_rules : dict, optional
+        Override default aggregation per attribute.
 
     Returns
     -------
     TemporalClustering
-        Container with the clustered network and aggregation details.
+        Result with clustered network and snapshot mapping.
 
-    Examples
-    --------
-    Basic usage with 12 typical days:
-
-    >>> result = n.clustering.cluster_temporally(
-    ...     n_typical_periods=12,
-    ...     hours_per_period=24,
-    ...     cluster_method="hierarchical"
-    ... )
-    >>> n_reduced = result.n
-    >>> print(f"Reduced from {len(n.snapshots)} to {len(n_reduced.snapshots)} snapshots")
-
-    With segmentation for further reduction:
-
-    >>> result = n.clustering.cluster_temporally(
-    ...     n_typical_periods=8,
-    ...     hours_per_period=24,
-    ...     n_segments=6,  # 6 segments per day
-    ...     cluster_method="k_means"
-    ... )
-
-    Preserving extreme periods:
-
-    >>> result = n.clustering.cluster_temporally(
-    ...     n_typical_periods=10,
-    ...     hours_per_period=24,
-    ...     extreme_period_method="append",
-    ...     add_peak_max=["Load-p_set-load1"]  # Ensure peak load is captured
-    ... )
-
-    See Also
-    --------
-    pypsa.clustering.temporal.get_optimal_aggregation_params : Find optimal parameters
-    tsam.TimeSeriesAggregation : Underlying tsam class
-
-    References
-    ----------
-    .. [1] Kotzur et al. (2018). Impact of different time series aggregation
-           methods on optimal energy system design. Renewable Energy.
     """
-    _check_tsam_installed()
-
-    logger.info(
-        f"Starting temporal clustering: {n_typical_periods} periods, "
-        f"{hours_per_period} hours/period, method={cluster_method}"
-    )
-
-    # Collect time series from network
-    time_series = _collect_time_series(
-        n,
-        include_generators=include_generators,
-        include_loads=include_loads,
-        include_storage_units=include_storage_units,
-        include_stores=include_stores,
-        include_links=include_links,
-        custom_columns=custom_time_series,
-    )
-
-    logger.info(f"Collected {len(time_series.columns)} time series for clustering")
-
-    # Check for storage components and warn about potential accuracy issues
-    has_stores = len(n.stores) > 0
-    has_storage_units = len(n.storage_units) > 0
-    if (has_stores or has_storage_units) and hours_per_period < 168:
-        storage_names = list(n.stores.index) + list(n.storage_units.index)
-        logger.warning(
-            f"Network contains storage components ({storage_names}) but "
-            f"hours_per_period={hours_per_period} < 168. With e_cyclic=True, "
-            f"storages must complete their cycle within each typical period. "
-            f"This can lead to significant over- or underestimation of storage "
-            f"capacity (up to +300% error for multi-day storage). Consider using "
-            f"hours_per_period=168 (weekly) for more accurate storage modeling."
-        )
-
-    # Prepare tsam parameters
-    tsam_kwargs: dict[str, Any] = {
-        "noTypicalPeriods": n_typical_periods,
-        "hoursPerPeriod": hours_per_period,
-        "clusterMethod": cluster_method,
-        "rescaleClusterPeriods": rescale_cluster_periods,
-        "extremePeriodMethod": extreme_period_method,
-        "solver": solver,
-    }
-
-    if n_segments is not None:
-        tsam_kwargs["segmentation"] = True
-        tsam_kwargs["noSegments"] = n_segments
-    else:
-        tsam_kwargs["segmentation"] = False
-
-    if representation_method is not None:
-        tsam_kwargs["representationMethod"] = representation_method
-
-    if weight_dict is not None:
-        tsam_kwargs["weightDict"] = weight_dict
-
-    if add_peak_min is not None:
-        tsam_kwargs["addPeakMin"] = add_peak_min
-
-    if add_peak_max is not None:
-        tsam_kwargs["addPeakMax"] = add_peak_max
-
-    # Create aggregation object
-    aggregation = tsam.TimeSeriesAggregation(time_series, **tsam_kwargs)
-
-    # Run clustering
-    typical_periods = aggregation.createTypicalPeriods()
-
-    logger.info(
-        f"Created {len(aggregation.clusterPeriodNoOccur)} typical periods "
-        f"with {len(typical_periods)} time steps total"
-    )
-
-    # Get accuracy indicators
-    try:
-        accuracy = aggregation.accuracyIndicators()
-    except Exception as e:
-        logger.warning(f"Could not compute accuracy indicators: {e}")
-        accuracy = pd.DataFrame()
-
-    # Get index matching for snapshot mapping
-    try:
-        snapshot_map = aggregation.indexMatching()
-    except Exception as e:
-        logger.warning(f"Could not compute snapshot mapping: {e}")
-        snapshot_map = pd.DataFrame()
-
-    # Create period weights
-    period_weights = pd.Series(
-        aggregation.clusterPeriodNoOccur,
-        name="occurrences"
-    )
-
-    # Apply to network
-    n_clustered = _apply_typical_periods_to_network(n, aggregation, typical_periods)
-
-    return TemporalClustering(
-        n=n_clustered,
-        aggregation=aggregation,
-        typical_periods=typical_periods,
-        period_weights=period_weights,
-        snapshot_map=snapshot_map,
-        accuracy_indicators=accuracy,
+    obj = TemporalClusteringMixin()
+    obj._n = n
+    return obj.get_resample_result(
+        offset, drop_leap_day=drop_leap_day, aggregation_rules=aggregation_rules
     )
 
 
-def get_optimal_aggregation_params(
-    n: "Network",
-    target_reduction: float = 0.05,
-    hours_per_period: int = 24,
-    cluster_method: ClusterMethod = "hierarchical",
-    include_generators: bool = True,
-    include_loads: bool = True,
-    include_storage_units: bool = True,
-    include_stores: bool = True,
-    include_links: bool = True,
-) -> tuple[int, int, float]:
-    """Find optimal number of periods and segments for a target data reduction.
-
-    Uses tsam's HyperTunedAggregations to find the Pareto-optimal combination
-    of typical periods and segments that minimizes RMSE for a given data
-    reduction target.
+def downsample(
+    n: Network,
+    stride: int,
+) -> TemporalClustering:
+    """Select every Nth snapshot as representative.
 
     Parameters
     ----------
     n : Network
-        The PyPSA network.
-    target_reduction : float, default 0.05
-        Target fraction of original data to retain (0.05 = 5% = 95% reduction).
-    hours_per_period : int, default 24
-        Length of each period in hours.
-    cluster_method : str, default "hierarchical"
-        Clustering method to use.
-    include_generators : bool, default True
-        Include generator time series.
-    include_loads : bool, default True
-        Include load time series.
-    include_storage_units : bool, default True
-        Include storage unit time series.
-    include_stores : bool, default True
-        Include store time series.
-    include_links : bool, default True
-        Include link time series.
+        Network with original resolution.
+    stride : int
+        Select every stride-th snapshot.
 
     Returns
     -------
-    n_segments : int
-        Optimal number of segments.
-    n_periods : int
-        Optimal number of typical periods.
-    rmse : float
-        Root mean square error of the aggregation.
+    TemporalClustering
+        Result with downsampled network.
 
-    Examples
-    --------
-    >>> segments, periods, rmse = n.clustering.get_optimal_aggregation_params(
-    ...     target_reduction=0.05  # Reduce to 5% of original data
-    ... )
-    >>> print(f"Optimal: {periods} periods with {segments} segments, RMSE={rmse:.4f}")
-    >>> result = n.clustering.cluster_temporally(
-    ...     n_typical_periods=periods,
-    ...     n_segments=segments
-    ... )
-
-    References
-    ----------
-    .. [1] Hoffmann et al. (2022). The Pareto-Optimal Temporal Aggregation
-           of Energy System Models. Applied Energy.
     """
-    _check_tsam_installed()
-    from tsam import hyperparametertuning as tune
-
-    logger.info(f"Finding optimal aggregation params for {target_reduction:.1%} data retention")
-
-    # Collect time series
-    time_series = _collect_time_series(
-        n,
-        include_generators=include_generators,
-        include_loads=include_loads,
-        include_storage_units=include_storage_units,
-        include_stores=include_stores,
-        include_links=include_links,
-    )
-
-    # Create base aggregation
-    base_aggregation = tsam.TimeSeriesAggregation(
-        time_series,
-        hoursPerPeriod=hours_per_period,
-        clusterMethod=cluster_method,
-        rescaleClusterPeriods=True,
-        segmentation=True,
-    )
-
-    # Use hypertuning
-    tuner = tune.HyperTunedAggregations(base_aggregation)
-
-    n_segments, n_periods, rmse = tuner.identifyOptimalSegmentPeriodCombination(
-        dataReduction=target_reduction
-    )
-
-    logger.info(
-        f"Optimal parameters: {n_periods} periods, {n_segments} segments, "
-        f"RMSE={rmse:.6f}"
-    )
-
-    return int(n_segments), int(n_periods), float(rmse)
+    obj = TemporalClusteringMixin()
+    obj._n = n
+    return obj.get_downsample_result(stride)
 
 
-def reconstruct_full_time_series(
-    n_clustered: "Network",
-    clustering_result: TemporalClustering,
-) -> pd.DataFrame:
-    """Reconstruct the full time series from clustered results.
-
-    This is useful for post-processing optimization results back to
-    the original temporal resolution.
+def segment(
+    n: Network,
+    num_segments: int,
+    *,
+    solver: str = "highs",
+    exclude_attrs: list[str] | None = None,
+    aggregation_rules: dict[str, str] | None = None,
+) -> TemporalClustering:
+    """Cluster time series into variable-duration segments using TSAM.
 
     Parameters
     ----------
-    n_clustered : Network
-        The clustered network with optimization results.
-    clustering_result : TemporalClustering
-        The clustering result containing the aggregation object.
+    n : Network
+        Network with original resolution.
+    num_segments : int
+        Target number of segments.
+    solver : str, default "highs"
+        MIP solver for time clustering.
+    exclude_attrs : list, optional
+        Attributes to exclude from clustering (default: ["e_min_pu"]).
+    aggregation_rules : dict, optional
+        Override default aggregation per attribute.
 
     Returns
     -------
-    pd.DataFrame
-        Reconstructed time series at original resolution.
+    TemporalClustering
+        Result with segmented network.
 
-    Examples
-    --------
-    >>> # After optimization
-    >>> result = n.clustering.cluster_temporally(n_typical_periods=12)
-    >>> n_reduced = result.n
-    >>> n_reduced.optimize()  # Optimize reduced network
-    >>> # Reconstruct results
-    >>> full_results = reconstruct_full_time_series(n_reduced, result)
     """
-    aggregation = clustering_result.aggregation
+    obj = TemporalClusteringMixin()
+    obj._n = n
+    return obj.get_segment_result(
+        num_segments,
+        solver=solver,
+        exclude_attrs=exclude_attrs,
+        aggregation_rules=aggregation_rules,
+    )
 
-    # Use tsam's prediction to reconstruct
-    predicted = aggregation.predictOriginalData()
 
-    return predicted
+def from_snapshot_map(
+    n: Network,
+    snapshot_map: pd.Series | pd.DataFrame,
+    *,
+    aggregation_rules: dict[str, str] | None = None,
+) -> TemporalClustering:
+    """Apply pre-computed temporal aggregation mapping.
+
+    Parameters
+    ----------
+    n : Network
+        Network with original resolution.
+    snapshot_map : pd.Series or pd.DataFrame
+        Mapping from original snapshots to aggregated snapshots.
+    aggregation_rules : dict, optional
+        Override default aggregation per attribute.
+
+    Returns
+    -------
+    TemporalClustering
+        Result with aggregated network.
+
+    """
+    obj = TemporalClusteringMixin()
+    obj._n = n
+    return obj.get_from_snapshot_map_result(
+        snapshot_map, aggregation_rules=aggregation_rules
+    )

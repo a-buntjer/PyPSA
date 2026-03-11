@@ -264,11 +264,12 @@ class Groupers:
         fall_back = pd.Series("", index=static.index)
         carrier_series = static.get("carrier", fall_back).rename("carrier")
         if nice_names:
-            # FIX: Use map() instead of replace() to avoid broadcasting errors
-            # with MultiIndex (stochastic networks). The replace() method causes
-            # pandas to perform element-wise comparisons that fail with MultiIndex.
-            nice_name = n.c.carriers.static.nice_name[lambda ds: ds != ""]
-            carrier_series = carrier_series.map(lambda x: nice_name.get(x, x if x != "" else "-"))
+            carrier_nice_name = n.c.carriers.static.nice_name[lambda ds: ds != ""]
+            carrier_series = (
+                self._map_with_multiindex(carrier_series, carrier_nice_name)
+                .fillna(carrier_series)
+                .replace("", "-")
+            )
         return carrier_series
 
     def bus_carrier(

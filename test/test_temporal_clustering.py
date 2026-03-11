@@ -2,1070 +2,570 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Tests for temporal clustering with tsam."""
-
 import numpy as np
 import pandas as pd
 import pytest
 
 import pypsa
-
-# Check if tsam is available
-try:
-    import tsam.timeseriesaggregation as tsam
-
-    HAS_TSAM = True
-except ImportError:
-    HAS_TSAM = False
+from pypsa.clustering.temporal import (
+    TemporalClustering,
+    downsample,
+    from_snapshot_map,
+    resample,
+)
 
 
 @pytest.fixture
-def network_with_time_series() -> pypsa.Network:
-    """Create a simple network with time-varying data for testing."""
+def simple_network():
+    """Create a simple network with hourly resolution for one week."""
     n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2021-01-01", periods=168, freq="h"))
 
-    # Set up snapshots (1 week hourly)
-    n.set_snapshots(pd.date_range("2020-01-01", periods=168, freq="h"))
-    n.snapshot_weightings.loc[:] = 1.0
-
-    # Add buses
     n.add("Bus", "bus0")
     n.add("Bus", "bus1")
-    n.add("Bus", "bus2")
-
-    # Add line
-    n.add("Line", "line0-1", bus0="bus0", bus1="bus1", s_nom=100, x=0.01)
-    n.add("Line", "line1-2", bus0="bus1", bus1="bus2", s_nom=100, x=0.01)
-
-    # Add generators with time-varying availability
-    solar_cf = np.maximum(0, np.sin(np.linspace(0, 14 * np.pi, 168)))  # Daily pattern
-    wind_cf = 0.3 + 0.2 * np.sin(np.linspace(0, 2 * np.pi, 168))  # Weekly pattern
 
     n.add(
         "Generator",
-        "solar",
+        "gen0",
         bus="bus0",
-        p_nom=50,
-        p_max_pu=solar_cf,
-        marginal_cost=0,
-        carrier="solar",
-    )
-
-    n.add(
-        "Generator",
-        "wind",
-        bus="bus1",
         p_nom=100,
-        p_max_pu=wind_cf,
-        marginal_cost=0,
-        carrier="wind",
+        marginal_cost=10,
     )
 
     n.add(
         "Generator",
-        "gas",
-        bus="bus2",
-        p_nom=200,
-        marginal_cost=50,
-        carrier="gas",
+        "gen1",
+        bus="bus1",
+        p_nom=50,
+        marginal_cost=20,
+        p_max_pu=np.random.default_rng(42).uniform(0.5, 1.0, 168),
     )
 
-    # Add load with time-varying demand
-    load_profile = 50 + 30 * np.sin(np.linspace(0, 14 * np.pi, 168))  # Daily pattern
-    n.add("Load", "load", bus="bus2", p_set=load_profile)
+    n.add("Load", "load0", bus="bus0", p_set=50)
+    n.add("Load", "load1", bus="bus1", p_set=30)
+
+    n.add("Line", "line01", bus0="bus0", bus1="bus1", s_nom=100, x=0.1, r=0.01)
 
     return n
 
 
 @pytest.fixture
-def network_annual() -> pypsa.Network:
-    """Create a network with annual hourly data."""
+def yearly_network():
+    """Create a network with full year hourly resolution (leap year)."""
     n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2020-01-01", periods=8784, freq="h"))
 
-    # Full year
-    n.set_snapshots(pd.date_range("2020-01-01", periods=8760, freq="h"))
-    n.snapshot_weightings.loc[:] = 1.0
-
-    # Add buses
     n.add("Bus", "bus0")
-
-    # Solar: daily and seasonal pattern
-    hours = np.arange(8760)
-    day_of_year = hours // 24
-    hour_of_day = hours % 24
-
-    # Seasonal factor
-    seasonal = 0.5 + 0.5 * np.cos(2 * np.pi * (day_of_year - 172) / 365)
-    # Daily factor
-    daily = np.maximum(0, np.cos(np.pi * (hour_of_day - 12) / 12))
-    solar_cf = seasonal * daily
-
     n.add(
         "Generator",
-        "solar",
+        "gen0",
         bus="bus0",
         p_nom=100,
-        p_max_pu=solar_cf,
-        marginal_cost=0,
+        p_max_pu=np.random.default_rng(42).uniform(0.3, 1.0, 8784),
     )
-
-    n.add(
-        "Generator",
-        "backup",
-        bus="bus0",
-        p_nom=200,
-        marginal_cost=100,
-    )
-
-    # Load profile with daily and seasonal patterns
-    base_load = 50
-    daily_load = 20 * np.sin(np.pi * (hour_of_day - 6) / 12)
-    seasonal_load = 10 * np.sin(2 * np.pi * (day_of_year - 200) / 365)
-    load_profile = base_load + daily_load + seasonal_load
-
-    n.add("Load", "load", bus="bus0", p_set=load_profile)
+    n.add("Load", "load0", bus="bus0", p_set=50)
 
     return n
 
 
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestTemporalClustering:
-    """Test temporal clustering functionality."""
+@pytest.fixture
+def multiperiod_network():
+    """Create a network with investment periods."""
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2021-01-01", periods=24, freq="h"))
+    n.set_investment_periods([2021, 2030])
 
-    def test_cluster_temporally_basic(self, network_with_time_series):
-        """Test basic temporal clustering."""
-        n = network_with_time_series
+    n.add("Bus", "bus0")
+    n.add("Generator", "gen0", bus="bus0", p_nom=100)
+    n.add("Load", "load0", bus="bus0", p_set=50)
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
-            cluster_method="hierarchical",
+    return n
+
+
+class TestResample:
+    def test_resample_3h(self, simple_network):
+        n = simple_network
+        result = resample(n, "3h")
+
+        assert isinstance(result, TemporalClustering)
+        assert len(result.n.snapshots) == 168 // 3
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(),
+            n.snapshot_weightings["objective"].sum(),
         )
 
-        # Check that result has expected attributes
-        assert hasattr(result, "n")
-        assert hasattr(result, "aggregation")
-        assert hasattr(result, "typical_periods")
-        assert hasattr(result, "period_weights")
+    def test_resample_preserves_total_hours(self, simple_network):
+        n = simple_network
+        original_hours = n.snapshot_weightings["objective"].sum()
 
-        # Check reduced network
-        n_reduced = result.n
-        assert len(n_reduced.snapshots) < len(n.snapshots)
-        assert len(n_reduced.snapshots) == 3 * 24  # 3 periods × 24 hours
+        result = resample(n, "6h")
+        new_hours = result.n.snapshot_weightings["objective"].sum()
 
-        # Check period weights sum approximately to original number of periods
-        total_hours = result.period_weights.sum() * 24
-        assert np.isclose(total_hours, 168, atol=24)  # Original was 168 hours
+        assert np.isclose(original_hours, new_hours)
 
-    def test_cluster_temporally_with_segmentation(self, network_with_time_series):
-        """Test temporal clustering with intra-period segmentation."""
-        n = network_with_time_series
+    def test_resample_daily(self, simple_network):
+        n = simple_network
+        result = resample(n, "24h")
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
-            n_segments=4,  # 4 segments per day
-            cluster_method="hierarchical",
+        assert len(result.n.snapshots) == 7
+
+    def test_resample_time_series_aggregated(self, simple_network):
+        n = simple_network
+        result = resample(n, "3h")
+
+        assert "p_max_pu" in result.n.c.generators.dynamic
+        assert len(result.n.c.generators.dynamic["p_max_pu"]) == len(result.n.snapshots)
+        assert np.allclose(
+            result.n.c.generators.dynamic["p_max_pu"],
+            n.c.generators.dynamic["p_max_pu"].resample("3h").mean(),
         )
 
-        n_reduced = result.n
+    def test_resample_snapshot_map(self, simple_network):
+        n = simple_network
+        result = resample(n, "3h")
 
-        # With segmentation, the number of snapshots depends on how tsam
-        # implements segmentation. The key is that we get fewer snapshots
-        # than the original.
-        assert len(n_reduced.snapshots) < len(n.snapshots)
+        assert len(result.snapshot_map) == len(n.snapshots)
+        assert result.snapshot_map.isin(result.n.snapshots).all()
 
-    def test_cluster_temporally_kmeans(self, network_with_time_series):
-        """Test temporal clustering with k-means method."""
-        n = network_with_time_series
+    def test_resample_accessor(self, simple_network):
+        n = simple_network
+        m = n.cluster.temporal.resample("3h")
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
-            cluster_method="k_means",
+        assert isinstance(m, pypsa.Network)
+        assert len(m.snapshots) == 168 // 3
+
+
+class TestDownsample:
+    def test_downsample_stride_4(self, simple_network):
+        n = simple_network
+        result = downsample(n, 4)
+
+        assert isinstance(result, TemporalClustering)
+        assert len(result.n.snapshots) == 168 // 4
+
+    def test_downsample_preserves_total_hours(self, simple_network):
+        n = simple_network
+        original_hours = n.snapshot_weightings["objective"].sum()
+
+        result = downsample(n, 4)
+        new_hours = result.n.snapshot_weightings["objective"].sum()
+
+        assert np.isclose(original_hours, new_hours)
+
+    def test_downsample_weightings_scaled(self, simple_network):
+        n = simple_network
+        stride = 4
+        result = downsample(n, stride)
+
+        expected_weight = n.snapshot_weightings["objective"].iloc[0] * stride
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].iloc[0], expected_weight
         )
 
-        n_reduced = result.n
-        assert len(n_reduced.snapshots) == 3 * 24
+    def test_downsample_time_series_selected(self, simple_network):
+        n = simple_network
+        result = downsample(n, 4)
 
-    def test_cluster_temporally_extreme_periods(self, network_with_time_series):
-        """Test temporal clustering with extreme period handling."""
-        n = network_with_time_series
+        original_values = n.c.generators.dynamic["p_max_pu"]["gen1"].iloc[::4]
+        new_values = result.n.c.generators.dynamic["p_max_pu"]["gen1"]
+        assert np.allclose(original_values.values, new_values.values)
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
-            cluster_method="hierarchical",
-            extreme_period_method="append",
-            add_peak_max=["Load-p_set-load"],
+    def test_downsample_invalid_stride(self, simple_network):
+        n = simple_network
+        with pytest.raises(ValueError, match="stride must be >= 1"):
+            downsample(n, 0)
+
+    def test_downsample_accessor(self, simple_network):
+        n = simple_network
+        m = n.cluster.temporal.downsample(4)
+
+        assert isinstance(m, pypsa.Network)
+        assert len(m.snapshots) == 168 // 4
+
+
+class TestFromSnapshotMap:
+    def test_from_snapshot_map_basic(self, simple_network):
+        n = simple_network
+        snapshot_map = pd.Series(
+            np.repeat(n.snapshots[::24], 24)[: len(n.snapshots)], index=n.snapshots
         )
 
-        # With extreme periods appended, we might have more periods
-        assert len(result.period_weights) >= 3
+        result = from_snapshot_map(n, snapshot_map)
 
-    def test_cluster_preserves_components(self, network_with_time_series):
-        """Test that clustering preserves static component data."""
-        n = network_with_time_series
+        assert isinstance(result, TemporalClustering)
+        assert len(result.n.snapshots) == 7
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+    def test_from_snapshot_map_preserves_hours(self, simple_network):
+        n = simple_network
+        original_hours = n.snapshot_weightings["objective"].sum()
+
+        snapshot_map = pd.Series(
+            np.repeat(n.snapshots[::24], 24)[: len(n.snapshots)], index=n.snapshots
+        )
+        result = from_snapshot_map(n, snapshot_map)
+
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(), original_hours
         )
 
-        n_reduced = result.n
+    def test_from_snapshot_map_invalid_index(self, simple_network):
+        n = simple_network
+        bad_index = pd.date_range("2019-01-01", periods=168, freq="h")
+        snapshot_map = pd.Series(n.snapshots[0], index=bad_index)
 
-        # Check that static components are preserved
-        assert len(n_reduced.buses) == len(n.buses)
-        assert len(n_reduced.generators) == len(n.generators)
-        assert len(n_reduced.loads) == len(n.loads)
-        assert len(n_reduced.lines) == len(n.lines)
+        with pytest.raises(ValueError, match="snapshot_map index must match"):
+            from_snapshot_map(n, snapshot_map)
 
-        # Check static attributes
-        assert n_reduced.generators.loc["gas", "marginal_cost"] == 50
-
-    def test_accuracy_indicators(self, network_with_time_series):
-        """Test that accuracy indicators are computed."""
-        n = network_with_time_series
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+    def test_from_snapshot_map_accessor(self, simple_network):
+        n = simple_network
+        snapshot_map = pd.Series(
+            np.repeat(n.snapshots[::24], 24)[: len(n.snapshots)], index=n.snapshots
         )
 
-        # Accuracy indicators should be a DataFrame
-        assert isinstance(result.accuracy_indicators, pd.DataFrame)
+        m = n.cluster.temporal.from_snapshot_map(snapshot_map)
 
-    def test_typical_periods_shape(self, network_with_time_series):
-        """Test typical periods have correct shape."""
-        n = network_with_time_series
+        assert isinstance(m, pypsa.Network)
+        assert len(m.snapshots) == 7
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+
+class TestNyears:
+    def test_nyears_hourly_week(self, simple_network):
+        n = simple_network
+        expected = 168 / 8760
+        assert np.isclose(n.nyears, expected)
+
+    def test_nyears_full_year(self, yearly_network):
+        n = yearly_network
+        # Leap year has 8784 hours (366 days), so nyears is slightly > 1.0
+        assert np.isclose(n.nyears, 8784 / 8760)
+
+    def test_nyears_preserved_after_resample(self, simple_network):
+        n = simple_network
+        original_nyears = n.nyears
+
+        result = resample(n, "3h")
+        assert np.isclose(result.n.nyears, original_nyears)
+
+    def test_nyears_preserved_after_downsample(self, simple_network):
+        n = simple_network
+        original_nyears = n.nyears
+
+        result = downsample(n, 4)
+        assert np.isclose(result.n.nyears, original_nyears)
+
+
+class TestLeapDay:
+    def test_drop_leap_day(self, yearly_network):
+        n = yearly_network
+        result = resample(n, "24h", drop_leap_day=True)
+
+        leap_day = pd.Timestamp("2020-02-29")
+        assert leap_day not in result.n.snapshots
+
+        original_hours = n.snapshot_weightings["objective"].sum()
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(), original_hours
         )
 
-        # Should have 3*24 = 72 time steps
-        assert len(result.typical_periods) == 72
 
-        # Should have same columns as collected time series
-        assert len(result.typical_periods.columns) > 0
+class TestAggregationRules:
+    def test_custom_aggregation_rules(self, simple_network):
+        n = simple_network
+        custom_rules = {"p_max_pu": "max"}
 
-    def test_snapshot_weightings_set(self, network_with_time_series):
-        """Test that snapshot weightings are correctly set."""
-        n = network_with_time_series
+        result = resample(n, "24h", aggregation_rules=custom_rules)
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+        assert "p_max_pu" in result.n.c.generators.dynamic
+
+
+class TestAccessorFullResults:
+    def test_get_resample_result(self, simple_network):
+        n = simple_network
+        result = n.cluster.temporal.get_resample_result("3h")
+
+        assert isinstance(result, TemporalClustering)
+        assert isinstance(result.n, pypsa.Network)
+        assert isinstance(result.snapshot_map, pd.Series)
+
+    def test_get_downsample_result(self, simple_network):
+        n = simple_network
+        result = n.cluster.temporal.get_downsample_result(4)
+
+        assert isinstance(result, TemporalClustering)
+
+
+class TestMultiperiod:
+    def test_resample_multiperiod(self, multiperiod_network):
+        n = multiperiod_network
+        result = resample(n, "3h")
+
+        assert result.n.has_periods
+        assert len(result.n.periods) == 2
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(),
+            n.snapshot_weightings["objective"].sum(),
         )
 
-        n_reduced = result.n
 
-        # Check weightings exist
-        assert hasattr(n_reduced, "snapshot_weightings")
-        assert len(n_reduced.snapshot_weightings) == len(n_reduced.snapshots)
-
-        # All weightings should be positive (check all values in DataFrame/Series)
-        assert (n_reduced.snapshot_weightings.values > 0).all()
+class TestSegment:
+    def test_segment_accessor_exists(self, simple_network):
+        n = simple_network
+        assert hasattr(n.cluster.temporal, "segment")
 
 
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestOptimalAggregationParams:
-    """Test optimal aggregation parameter finding."""
-
-    def test_get_optimal_params_basic(self, network_with_time_series):
-        """Test finding optimal parameters."""
-        n = network_with_time_series
-
-        # Use a high reduction target for fast test
-        n_segments, n_periods, rmse = n.cluster.get_optimal_aggregation_params(
-            target_reduction=0.3,  # 30% retention
-            hours_per_period=24,
-        )
-
-        assert n_segments > 0
-        assert n_periods > 0
-        assert rmse >= 0
-
-
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestReconstructFullTimeSeries:
-    """Test time series reconstruction."""
-
-    def test_reconstruct_basic(self, network_with_time_series):
-        """Test reconstructing original time series."""
-        from pypsa.clustering.temporal import reconstruct_full_time_series
-
-        n = network_with_time_series
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
-        )
-
-        # Reconstruct
-        reconstructed = reconstruct_full_time_series(result.n, result)
-
-        # Should have original length
-        assert len(reconstructed) == 168  # Original number of snapshots
-
-
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestIntegrationWithOptimization:
-    """Test that clustered networks can be optimized."""
-
-    def test_clustered_network_optimization(self, network_with_time_series):
-        """Test that a clustered network can be optimized."""
-        n = network_with_time_series
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=2,
-            hours_per_period=24,
-        )
-
-        n_reduced = result.n
-
-        # Should be able to run optimization
-        # Note: This will fail if no solver is installed, which is OK
-        try:
-            n_reduced.optimize(solver_name="highs")
-            assert n_reduced.status == "ok"
-        except Exception:
-            # No solver available, but network structure is valid
-            pass
-
-
-@pytest.mark.skipif(HAS_TSAM, reason="testing tsam not installed")
-def test_tsam_import_error():
-    """Test proper error when tsam not installed."""
-    from pypsa.clustering.temporal import _check_tsam_installed
-
-    with pytest.raises(ImportError, match="tsam"):
-        _check_tsam_installed()
-
-
-class TestCollectTimeSeries:
-    """Test time series collection from network."""
-
-    @pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-    def test_collect_generators(self, network_with_time_series):
-        """Test collecting generator time series."""
-        from pypsa.clustering.temporal import _collect_time_series
-
-        n = network_with_time_series
-        ts = _collect_time_series(n, include_loads=False)
-
-        # Should have generator columns
-        gen_cols = [c for c in ts.columns if "Generator" in c]
-        assert len(gen_cols) > 0
-
-    @pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-    def test_collect_loads(self, network_with_time_series):
-        """Test collecting load time series."""
-        from pypsa.clustering.temporal import _collect_time_series
-
-        n = network_with_time_series
-        ts = _collect_time_series(n, include_generators=False)
-
-        # Should have load columns
-        load_cols = [c for c in ts.columns if "Load" in c]
-        assert len(load_cols) > 0
-
-    @pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-    def test_collect_empty_network_error(self):
-        """Test error when no time series data available."""
-        from pypsa.clustering.temporal import _collect_time_series
-
+class TestEdgeCases:
+    def test_empty_dynamic_data(self):
         n = pypsa.Network()
-        n.set_snapshots(pd.date_range("2020-01-01", periods=24, freq="h"))
+        n.set_snapshots(pd.date_range("2021-01-01", periods=24, freq="h"))
         n.add("Bus", "bus0")
+        n.add("Generator", "gen0", bus="bus0", p_nom=100)
 
-        with pytest.raises(ValueError, match="No time series data"):
-            _collect_time_series(n)
+        result = resample(n, "3h")
+        assert len(result.n.snapshots) == 8
 
+    def test_single_snapshot_stride(self, simple_network):
+        n = simple_network
+        result = downsample(n, 1)
 
-# =============================================================================
-# Feature Combination Tests
-# =============================================================================
+        assert len(result.n.snapshots) == len(n.snapshots)
 
+    def test_large_stride(self, simple_network):
+        n = simple_network
+        result = downsample(n, 168)
 
-@pytest.fixture
-def network_committable_extendable() -> pypsa.Network:
-    """Create a network with committable and extendable generators."""
-    n = pypsa.Network()
+        assert len(result.n.snapshots) == 1
+        assert np.isclose(result.n.snapshot_weightings["objective"].iloc[0], 168)
 
-    # Set up snapshots (1 week hourly)
-    n.set_snapshots(pd.date_range("2020-01-01", periods=168, freq="h"))
-    n.snapshot_weightings.loc[:] = 1.0
+    def test_downsample_multiperiod(self, multiperiod_network):
+        n = multiperiod_network
+        original_hours = n.snapshot_weightings["objective"].sum()
 
-    # Add buses
-    n.add("Bus", "bus0")
-    n.add("Bus", "bus1")
+        result = downsample(n, 4)
 
-    # Add line
-    n.add("Line", "line0-1", bus0="bus0", bus1="bus1", s_nom=100, x=0.01)
-
-    # Solar: time-varying, extendable
-    solar_cf = np.maximum(0, np.sin(np.linspace(0, 14 * np.pi, 168)))
-    n.add(
-        "Generator",
-        "solar",
-        bus="bus0",
-        p_nom=0,
-        p_nom_extendable=True,
-        p_nom_max=100,
-        p_max_pu=solar_cf,
-        marginal_cost=0,
-        capital_cost=1000,
-        carrier="solar",
-    )
-
-    # Gas: committable and extendable
-    n.add(
-        "Generator",
-        "gas",
-        bus="bus1",
-        p_nom=50,
-        p_nom_extendable=True,
-        p_nom_max=200,
-        p_min_pu=0.3,  # Min stable generation
-        marginal_cost=50,
-        capital_cost=500,
-        committable=True,
-        start_up_cost=100,
-        shut_down_cost=50,
-        min_up_time=2,
-        min_down_time=2,
-        carrier="gas",
-    )
-
-    # Load
-    load_profile = 50 + 30 * np.sin(np.linspace(0, 14 * np.pi, 168))
-    n.add("Load", "load", bus="bus1", p_set=load_profile)
-
-    return n
-
-
-@pytest.fixture
-def network_multi_invest() -> pypsa.Network:
-    """Create a network with multiple investment periods."""
-    n = pypsa.Network()
-
-    # Create investment periods first
-    investment_periods = pd.Index([2020, 2030], name="period")
-
-    # Set up snapshots - need to be MultiIndex with (period, timestep)
-    snapshots_per_period = pd.date_range("2020-01-01", periods=168, freq="h")
-    multi_snapshots = pd.MultiIndex.from_product(
-        [investment_periods, snapshots_per_period],
-        names=["period", "timestep"]
-    )
-    n.set_snapshots(multi_snapshots)
-    n.snapshot_weightings.loc[:, "objective"] = 1.0
-    n.snapshot_weightings.loc[:, "generators"] = 1.0
-    n.snapshot_weightings.loc[:, "stores"] = 1.0
-
-    # Set investment period weightings
-    n.investment_period_weightings = pd.DataFrame(
-        {"years": [10.0, 10.0], "objective": [1.0, 0.9]},
-        index=investment_periods
-    )
-
-    # Add buses
-    n.add("Bus", "bus0")
-
-    # Solar with build_year - p_max_pu needs to match full snapshot length
-    solar_cf_single = np.maximum(0, np.sin(np.linspace(0, 14 * np.pi, 168)))
-    solar_cf = np.tile(solar_cf_single, 2)  # Repeat for 2 investment periods
-
-    n.add(
-        "Generator",
-        "solar_2020",
-        bus="bus0",
-        p_nom=0,
-        p_nom_extendable=True,
-        p_nom_max=100,
-        p_max_pu=solar_cf,
-        marginal_cost=0,
-        capital_cost=1000,
-        build_year=2020,
-        lifetime=25,
-        carrier="solar",
-    )
-
-    n.add(
-        "Generator",
-        "solar_2030",
-        bus="bus0",
-        p_nom=0,
-        p_nom_extendable=True,
-        p_nom_max=200,
-        p_max_pu=solar_cf,
-        marginal_cost=0,
-        capital_cost=500,  # Cheaper in 2030
-        build_year=2030,
-        lifetime=25,
-        carrier="solar",
-    )
-
-    # Backup generator
-    n.add(
-        "Generator",
-        "backup",
-        bus="bus0",
-        p_nom=200,
-        marginal_cost=100,
-        carrier="gas",
-    )
-
-    # Load - also needs to match full snapshot length
-    load_single = 50 + 30 * np.sin(np.linspace(0, 14 * np.pi, 168))
-    load_profile = np.tile(load_single, 2)
-    n.add("Load", "load", bus="bus0", p_set=load_profile)
-
-    return n
-
-
-@pytest.fixture
-def network_with_storage() -> pypsa.Network:
-    """Create a network with storage units."""
-    n = pypsa.Network()
-
-    # Set up snapshots (1 week hourly)
-    n.set_snapshots(pd.date_range("2020-01-01", periods=168, freq="h"))
-    n.snapshot_weightings.loc[:] = 1.0
-
-    # Add buses
-    n.add("Bus", "bus0")
-
-    # Solar
-    solar_cf = np.maximum(0, np.sin(np.linspace(0, 14 * np.pi, 168)))
-    n.add(
-        "Generator",
-        "solar",
-        bus="bus0",
-        p_nom=100,
-        p_max_pu=solar_cf,
-        marginal_cost=0,
-        carrier="solar",
-    )
-
-    # Backup
-    n.add(
-        "Generator",
-        "backup",
-        bus="bus0",
-        p_nom=200,
-        marginal_cost=100,
-        carrier="gas",
-    )
-
-    # Storage unit
-    n.add(
-        "StorageUnit",
-        "battery",
-        bus="bus0",
-        p_nom=50,
-        max_hours=4,
-        efficiency_store=0.9,
-        efficiency_dispatch=0.9,
-        cyclic_state_of_charge=True,
-    )
-
-    # Load
-    load_profile = 50 + 30 * np.sin(np.linspace(0, 14 * np.pi, 168))
-    n.add("Load", "load", bus="bus0", p_set=load_profile)
-
-    return n
-
-
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestTemporalClusteringWithCommittableExtendable:
-    """Test temporal clustering with committable and extendable generators."""
-
-    def test_cluster_preserves_committable_attrs(self, network_committable_extendable):
-        """Test that committable attributes are preserved after clustering."""
-        n = network_committable_extendable
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+        # 24 snapshots per period / 4 = 6 per period, 2 periods = 12 total
+        assert len(result.n.snapshots) == 12
+        assert result.n.has_periods
+        assert len(result.n.periods) == 2
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(), original_hours
         )
 
-        n_reduced = result.n
+    def test_downsample_multiperiod_snapshot_map(self, multiperiod_network):
+        n = multiperiod_network
+        result = downsample(n, 4)
 
-        # Check committable attributes preserved
-        gas = n_reduced.generators.loc["gas"]
-        assert gas["committable"] == True
-        assert gas["start_up_cost"] == 100
-        assert gas["shut_down_cost"] == 50
-        assert gas["min_up_time"] == 2
-        assert gas["min_down_time"] == 2
+        assert len(result.snapshot_map) == len(n.snapshots)
+        assert all(s in result.n.snapshots for s in result.snapshot_map.values)
 
-    def test_cluster_preserves_extendable_attrs(self, network_committable_extendable):
-        """Test that extendable attributes are preserved after clustering."""
-        n = network_committable_extendable
+    def test_downsample_multiperiod_non_divisible_stride(self, multiperiod_network):
+        n = multiperiod_network
+        original_hours = n.snapshot_weightings["objective"].sum()
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+        result = downsample(n, 5)  # 24 % 5 = 4 remainder
+
+        # ceil(24/5) = 5 snapshots per period, 2 periods = 10 total
+        assert len(result.n.snapshots) == 10
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(), original_hours
         )
 
-        n_reduced = result.n
+    def test_downsample_multiperiod_large_stride(self, multiperiod_network):
+        n = multiperiod_network
+        original_hours = n.snapshot_weightings["objective"].sum()
 
-        # Check extendable attributes preserved
-        solar = n_reduced.generators.loc["solar"]
-        assert solar["p_nom_extendable"] == True
-        assert solar["p_nom_max"] == 100
-        assert solar["capital_cost"] == 1000
+        result = downsample(n, 24)  # Each period reduced to 1 snapshot
 
-    def test_optimization_committable_extendable(self, network_committable_extendable):
-        """Test that clustered network with committable+extendable optimizes."""
-        n = network_committable_extendable
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=2,
-            hours_per_period=24,
+        assert len(result.n.snapshots) == 2  # One per period
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(), original_hours
         )
 
-        n_reduced = result.n
+    def test_from_snapshot_map_dataframe_input(self, simple_network):
+        n = simple_network
+        snapshot_map_series = pd.Series(
+            np.repeat(n.snapshots[::24], 24)[: len(n.snapshots)], index=n.snapshots
+        )
+        snapshot_map_df = pd.DataFrame({"map": snapshot_map_series})
 
-        try:
-            n_reduced.optimize(solver_name="highs")
-            assert n_reduced.status == "ok"
+        result = from_snapshot_map(n, snapshot_map_df)
 
-            # Check that optimization produced valid results
-            assert n_reduced.generators.loc["solar", "p_nom_opt"] >= 0
-            assert n_reduced.generators.loc["gas", "p_nom_opt"] >= n_reduced.generators.loc["gas", "p_nom"]
-        except Exception as e:
-            pytest.skip(f"Solver not available or optimization failed: {e}")
+        assert isinstance(result, TemporalClustering)
+        assert len(result.n.snapshots) == 7
 
+    def test_downsample_stride_not_divisible(self, simple_network):
+        n = simple_network
+        original_hours = n.snapshot_weightings["objective"].sum()
 
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestTemporalClusteringWithMultiInvest:
-    """Test temporal clustering with multiple investment periods."""
+        result = downsample(n, 5)
 
-    def test_cluster_with_investment_periods(self, network_multi_invest):
-        """Test that clustering works with investment periods.
-        
-        Note: Currently, temporal clustering flattens the snapshot structure,
-        which means the investment period structure is not preserved. This test
-        documents the current behavior.
-        """
-        n = network_multi_invest
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+        assert len(result.n.snapshots) == (168 + 5 - 1) // 5  # ceiling division
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(), original_hours
         )
 
-        n_reduced = result.n
+    def test_resample_frequency_larger_than_snapshots(self, simple_network):
+        n = simple_network
+        original_hours = n.snapshot_weightings["objective"].sum()
 
-        # Currently, investment periods are NOT preserved by temporal clustering
-        # This is a known limitation - the clustering flattens the snapshot structure
-        # The network is still valid, but loses the multi-invest structure
-        assert hasattr(n_reduced, "investment_periods")
-        # Investment periods become empty after clustering (current limitation)
-        # Future improvement: preserve investment period structure
-        assert len(n_reduced.snapshots) > 0  # Network has valid snapshots
+        result = resample(n, "500h")
 
-    def test_cluster_preserves_build_years(self, network_multi_invest):
-        """Test that build_year attributes are preserved."""
-        n = network_multi_invest
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+        assert len(result.n.snapshots) == 1
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(), original_hours
         )
 
-        n_reduced = result.n
 
-        # Check build years preserved
-        assert n_reduced.generators.loc["solar_2020", "build_year"] == 2020
-        assert n_reduced.generators.loc["solar_2030", "build_year"] == 2030
-
-    def test_optimization_multi_invest(self, network_multi_invest):
-        """Test optimization with multi-investment after clustering."""
-        n = network_multi_invest
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=2,
-            hours_per_period=24,
+class TestAggregationRulesDetailed:
+    def test_e_min_pu_uses_max(self, simple_network):
+        n = simple_network
+        n.add(
+            "StorageUnit",
+            "storage0",
+            bus="bus0",
+            p_nom=10,
+            e_min_pu=np.random.default_rng(42).uniform(0.1, 0.3, 168),
         )
 
-        n_reduced = result.n
+        result = resample(n, "24h")
 
-        try:
-            n_reduced.optimize(solver_name="highs", multi_investment_periods=True)
-            assert n_reduced.status == "ok"
-        except Exception as e:
-            pytest.skip(f"Multi-invest optimization not available: {e}")
+        assert "e_min_pu" in result.n.c.storage_units.dynamic
 
-
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestTemporalClusteringWithStorage:
-    """Test temporal clustering with storage units."""
-
-    def test_cluster_preserves_storage_attrs(self, network_with_storage):
-        """Test that storage attributes are preserved after clustering."""
-        n = network_with_storage
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+    def test_e_max_pu_uses_min(self, simple_network):
+        n = simple_network
+        n.add(
+            "StorageUnit",
+            "storage0",
+            bus="bus0",
+            p_nom=10,
+            e_max_pu=np.random.default_rng(42).uniform(0.7, 1.0, 168),
         )
 
-        n_reduced = result.n
+        result = resample(n, "24h")
 
-        # Check storage attributes preserved
-        battery = n_reduced.storage_units.loc["battery"]
-        assert battery["p_nom"] == 50
-        assert battery["max_hours"] == 4
-        assert battery["efficiency_store"] == 0.9
-        assert battery["efficiency_dispatch"] == 0.9
-        assert battery["cyclic_state_of_charge"] == True
+        assert "e_max_pu" in result.n.c.storage_units.dynamic
 
-    def test_optimization_with_storage(self, network_with_storage):
-        """Test that clustered network with storage optimizes."""
-        n = network_with_storage
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+class TestAccessorFullResultsExtended:
+    def test_get_from_snapshot_map_result(self, simple_network):
+        n = simple_network
+        snapshot_map = pd.Series(
+            np.repeat(n.snapshots[::24], 24)[: len(n.snapshots)], index=n.snapshots
         )
 
-        n_reduced = result.n
+        result = n.cluster.temporal.get_from_snapshot_map_result(snapshot_map)
 
-        try:
-            n_reduced.optimize(solver_name="highs")
-            assert n_reduced.status == "ok"
-        except Exception as e:
-            pytest.skip(f"Solver not available: {e}")
+        assert isinstance(result, TemporalClustering)
+        assert isinstance(result.n, pypsa.Network)
+        assert isinstance(result.snapshot_map, pd.Series)
 
 
-@pytest.fixture
-def network_stochastic() -> pypsa.Network:
-    """Create a stochastic network with scenarios."""
-    n = pypsa.Network()
+class TestSegmentErrors:
+    def test_segment_invalid_num_segments(self, simple_network):
+        from pypsa.clustering.temporal import segment
 
-    # Set up snapshots (1 week hourly)
-    n.set_snapshots(pd.date_range("2020-01-01", periods=168, freq="h"))
-    n.snapshot_weightings.loc[:] = 1.0
+        n = simple_network
+        with pytest.raises(ValueError, match="num_segments must be >= 1"):
+            segment(n, 0)
 
-    # Add buses
-    n.add("Bus", "bus0")
-    n.add("Bus", "bus1")
-
-    # Add line
-    n.add("Line", "line0-1", bus0="bus0", bus1="bus1", s_nom=100, x=0.01)
-
-    # Solar with time-varying availability
-    solar_cf = np.maximum(0, np.sin(np.linspace(0, 14 * np.pi, 168)))
-    n.add(
-        "Generator",
-        "solar",
-        bus="bus0",
-        p_nom=0,
-        p_nom_extendable=True,
-        p_nom_max=100,
-        p_max_pu=solar_cf,
-        marginal_cost=0,
-        capital_cost=1000,
-        carrier="solar",
-    )
-
-    # Gas generator
-    n.add(
-        "Generator",
-        "gas",
-        bus="bus1",
-        p_nom=200,
-        marginal_cost=50,
-        carrier="gas",
-    )
-
-    # Load with time-varying demand
-    load_profile = 50 + 30 * np.sin(np.linspace(0, 14 * np.pi, 168))
-    n.add("Load", "load", bus="bus1", p_set=load_profile)
-
-    # Now add scenarios AFTER adding all components
-    n.set_scenarios({"low": 0.3, "medium": 0.4, "high": 0.3})
-
-    return n
-
-
-@pytest.fixture
-def network_stochastic_multi_invest() -> pypsa.Network:
-    """Create a stochastic network with scenarios and multi-investment periods."""
-    n = pypsa.Network()
-
-    # Create investment periods first with MultiIndex snapshots
-    investment_periods = pd.Index([2020, 2030], name="period")
-    snapshots_per_period = pd.date_range("2020-01-01", periods=168, freq="h")
-    multi_snapshots = pd.MultiIndex.from_product(
-        [investment_periods, snapshots_per_period],
-        names=["period", "timestep"]
-    )
-    n.set_snapshots(multi_snapshots)
-    n.snapshot_weightings.loc[:, "objective"] = 1.0
-    n.snapshot_weightings.loc[:, "generators"] = 1.0
-    n.snapshot_weightings.loc[:, "stores"] = 1.0
-
-    # Set investment period weightings
-    n.investment_period_weightings = pd.DataFrame(
-        {"years": [10.0, 10.0], "objective": [1.0, 0.9]},
-        index=investment_periods
-    )
-
-    # Add buses
-    n.add("Bus", "bus0")
-
-    # Solar with time-varying availability - needs to match full snapshot length
-    solar_cf_single = np.maximum(0, np.sin(np.linspace(0, 14 * np.pi, 168)))
-    solar_cf = np.tile(solar_cf_single, 2)  # Repeat for 2 investment periods
-
-    n.add(
-        "Generator",
-        "solar",
-        bus="bus0",
-        p_nom=0,
-        p_nom_extendable=True,
-        p_nom_max=100,
-        p_max_pu=solar_cf,
-        marginal_cost=0,
-        capital_cost=1000,
-        build_year=2020,
-        lifetime=25,
-        carrier="solar",
-    )
-
-    # Backup generator
-    n.add(
-        "Generator",
-        "backup",
-        bus="bus0",
-        p_nom=200,
-        marginal_cost=100,
-        carrier="gas",
-    )
-
-    # Load - also needs to match full snapshot length
-    load_single = 50 + 30 * np.sin(np.linspace(0, 14 * np.pi, 168))
-    load_profile = np.tile(load_single, 2)
-    n.add("Load", "load", bus="bus0", p_set=load_profile)
-
-    # Add scenarios
-    n.set_scenarios({"low": 0.3, "high": 0.7})
-
-    return n
-
-
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestTemporalClusteringWithStochastic:
-    """Test temporal clustering with stochastic networks."""
-
-    def test_stochastic_basic_clustering(self, network_stochastic):
-        """Test that stochastic networks can be clustered."""
-        n = network_stochastic
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+    def test_segment_multiperiod_raises(self, multiperiod_network):
+        pytest.importorskip("tsam")
+        n = multiperiod_network
+        n.add(
+            "Generator",
+            "gen_vary",
+            bus="bus0",
+            p_nom=50,
+            p_max_pu=np.random.default_rng(42).uniform(0.5, 1.0, 48),
         )
 
-        n_reduced = result.n
+        from pypsa.clustering.temporal import segment
 
-        # Network should be created successfully
-        assert n_reduced is not None
-        assert len(n_reduced.snapshots) == 72  # 3 periods × 24 hours
+        with pytest.raises(NotImplementedError, match="does not yet support"):
+            segment(n, 5)
 
-        # Scenarios should be preserved
-        assert n_reduced.has_scenarios
-        assert len(n_reduced.scenarios) == 3
-        assert "low" in n_reduced.scenarios
-        assert "medium" in n_reduced.scenarios
-        assert "high" in n_reduced.scenarios
+    def test_segment_no_dynamic_data(self):
+        pytest.importorskip("tsam")
+        n = pypsa.Network()
+        n.set_snapshots(pd.date_range("2021-01-01", periods=24, freq="h"))
+        n.add("Bus", "bus0")
+        n.add("Generator", "gen0", bus="bus0", p_nom=100)
 
-    def test_stochastic_preserves_scenario_weightings(self, network_stochastic):
-        """Test that scenario weightings are preserved."""
-        n = network_stochastic
+        from pypsa.clustering.temporal import segment
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+        with pytest.raises(ValueError, match="No time-varying data"):
+            segment(n, 5)
+
+
+class TestSegmentFunctionality:
+    def test_segment_basic(self, simple_network):
+        pytest.importorskip("tsam")
+        n = simple_network
+
+        from pypsa.clustering.temporal import segment
+
+        result = segment(n, 10)
+
+        assert isinstance(result, TemporalClustering)
+        assert len(result.n.snapshots) == 10
+        assert np.isclose(
+            result.n.snapshot_weightings["objective"].sum(),
+            n.snapshot_weightings["objective"].sum(),
         )
 
-        n_reduced = result.n
+    def test_segment_accessor(self, simple_network):
+        pytest.importorskip("tsam")
+        n = simple_network
 
-        # Check scenario weightings
-        assert hasattr(n_reduced, "scenario_weightings")
-        assert np.isclose(n_reduced.scenario_weightings.loc["low", "weight"], 0.3)
-        assert np.isclose(n_reduced.scenario_weightings.loc["medium", "weight"], 0.4)
-        assert np.isclose(n_reduced.scenario_weightings.loc["high", "weight"], 0.3)
+        m = n.cluster.temporal.segment(10)
 
-    def test_stochastic_preserves_components(self, network_stochastic):
-        """Test that components are preserved in stochastic clustered network."""
-        n = network_stochastic
+        assert isinstance(m, pypsa.Network)
+        assert len(m.snapshots) == 10
 
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
+    def test_get_segment_result(self, simple_network):
+        pytest.importorskip("tsam")
+        n = simple_network
+
+        result = n.cluster.temporal.get_segment_result(10)
+
+        assert isinstance(result, TemporalClustering)
+        assert isinstance(result.n, pypsa.Network)
+        assert isinstance(result.snapshot_map, pd.Series)
+
+
+class TestStochasticNotSupported:
+    """Temporal clustering should raise error for stochastic networks."""
+
+    @pytest.fixture
+    def stochastic_network(self):
+        """Create a simple stochastic network."""
+        n = pypsa.Network()
+        n.set_snapshots(pd.date_range("2021-01-01", periods=24, freq="h"))
+        n.set_scenarios(low=0.5, high=0.5)
+
+        n.add("Bus", "bus0")
+        n.add("Generator", "gen0", bus="bus0", p_nom=100)
+        n.add("Load", "load0", bus="bus0", p_set=50)
+
+        return n
+
+    def test_resample_stochastic_raises(self, stochastic_network):
+        with pytest.raises(NotImplementedError, match="stochastic networks"):
+            resample(stochastic_network, "3h")
+
+    def test_downsample_stochastic_raises(self, stochastic_network):
+        with pytest.raises(NotImplementedError, match="stochastic networks"):
+            downsample(stochastic_network, 4)
+
+    def test_segment_stochastic_raises(self, stochastic_network):
+        pytest.importorskip("tsam")
+        from pypsa.clustering.temporal import segment
+
+        with pytest.raises(NotImplementedError, match="stochastic networks"):
+            segment(stochastic_network, 10)
+
+    def test_from_snapshot_map_stochastic_raises(self, stochastic_network):
+        snapshot_map = pd.Series(
+            stochastic_network.snapshots[0], index=stochastic_network.snapshots
         )
-
-        n_reduced = result.n
-
-        # Check static components preserved (with scenario MultiIndex)
-        assert len(n_reduced.buses) == len(n.scenarios) * 2  # 2 buses × 3 scenarios
-        assert len(n_reduced.generators) == len(n.scenarios) * 2  # 2 generators × 3 scenarios
-
-    def test_stochastic_optimization(self, network_stochastic):
-        """Test that stochastic clustered network can be optimized."""
-        n = network_stochastic
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=2,
-            hours_per_period=24,
-        )
-
-        n_reduced = result.n
-
-        try:
-            n_reduced.optimize(solver_name="highs")
-            assert n_reduced.status == "ok"
-        except Exception as e:
-            pytest.skip(f"Solver or stochastic optimization not available: {e}")
-
-
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestTemporalClusteringWithStochasticMultiInvest:
-    """Test temporal clustering with stochastic + multi-investment networks."""
-
-    def test_stochastic_multi_invest_basic(self, network_stochastic_multi_invest):
-        """Test clustering stochastic network with multi-investment periods."""
-        n = network_stochastic_multi_invest
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
-        )
-
-        n_reduced = result.n
-
-        # Network should be created
-        assert n_reduced is not None
-        assert len(n_reduced.snapshots) > 0
-
-        # Scenarios should be preserved
-        assert n_reduced.has_scenarios
-        assert "low" in n_reduced.scenarios
-        assert "high" in n_reduced.scenarios
-
-    def test_stochastic_multi_invest_preserves_build_years(self, network_stochastic_multi_invest):
-        """Test that build_year attributes are preserved."""
-        n = network_stochastic_multi_invest
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
-        )
-
-        n_reduced = result.n
-
-        # Build year should be preserved in at least one scenario
-        generators = n_reduced.generators
-        if isinstance(generators.index, pd.MultiIndex):
-            # Get first scenario
-            first_scenario = generators.index.get_level_values(0)[0]
-            gen_data = generators.xs(first_scenario, level=0)
-            assert gen_data.loc["solar", "build_year"] == 2020
-
-
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestTemporalClusteringWithRollingHorizon:
-    """Test temporal clustering compatibility with rolling horizon optimization."""
-
-    def test_cluster_then_rolling_horizon(self, network_with_storage):
-        """Test rolling horizon on clustered network."""
-        n = network_with_storage
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
-        )
-
-        n_reduced = result.n
-
-        # Rolling horizon should work on clustered network
-        # Note: This tests the structure, actual rolling horizon behavior
-        # depends on snapshot structure which is modified by clustering
-        try:
-            # Simple rolling horizon with 1-day windows
-            n_reduced.optimize(
-                solver_name="highs",
-                extra_functionality=lambda n, sns: None,  # Dummy
-            )
-            # If we get here, the network structure is valid
-        except Exception:
-            # Structure is still valid even if optimization fails
-            pass
-
-        # Check network is still valid
-        assert len(n_reduced.snapshots) == 3 * 24
-        assert len(n_reduced.storage_units) == 1
-
-
-@pytest.mark.skipif(not HAS_TSAM, reason="tsam not installed")
-class TestTemporalClusteringEdgeCases:
-    """Test edge cases for temporal clustering."""
-
-    def test_single_period(self, network_with_time_series):
-        """Test clustering to a single period."""
-        n = network_with_time_series
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=1,
-            hours_per_period=24,
-        )
-
-        n_reduced = result.n
-        assert len(n_reduced.snapshots) == 24
-
-    def test_many_periods(self, network_with_time_series):
-        """Test clustering to many periods (approaching full resolution)."""
-        n = network_with_time_series
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=7,  # All 7 days as separate periods
-            hours_per_period=24,
-        )
-
-        n_reduced = result.n
-        assert len(n_reduced.snapshots) == 7 * 24
-
-    def test_non_24h_periods(self, network_with_time_series):
-        """Test clustering with non-24-hour periods."""
-        n = network_with_time_series
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=4,
-            hours_per_period=12,  # 12-hour periods
-        )
-
-        n_reduced = result.n
-        # 168 hours / 12 hours per period = 14 original periods
-        # Clustered to 4 typical periods × 12 hours = 48 snapshots
-        assert len(n_reduced.snapshots) == 4 * 12
-
-    def test_weight_dict(self, network_with_time_series):
-        """Test clustering with custom weights for time series."""
-        n = network_with_time_series
-
-        result = n.cluster.cluster_temporally(
-            n_typical_periods=3,
-            hours_per_period=24,
-            weight_dict={"Load-p_set-load": 2.0},  # Double weight for load
-        )
-
-        # Should complete without error
-        assert result.n is not None
-        assert len(result.n.snapshots) == 72
+        with pytest.raises(NotImplementedError, match="stochastic networks"):
+            from_snapshot_map(stochastic_network, snapshot_map)

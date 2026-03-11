@@ -5,6 +5,7 @@ SPDX-License-Identifier: CC-BY-4.0
 -->
 
 # Release Notes
+
 ## Upcoming Release
 
 !!! info "Upcoming Release"
@@ -15,7 +16,144 @@ SPDX-License-Identifier: CC-BY-4.0
 
 ### Features
 
-- Add `stats` as a shorthand alias for the `statistics` accessor. Users can now use `n.stats` interchangeably with `n.statistics`. (<!-- md:pr 1448 -->)
+- Add configurable numerical tolerance for consistency checks via the new `params.consistency.numerical_tolerance` option (default `1e-9`). This prevents false warnings from floating-point noise when comparing attributes like `p_min_pu` vs `p_max_pu`, `p_nom_min` vs `p_nom_max`, and `e_sum_min` vs `e_sum_max`.
+
+- New Process component mirroring the behavior of a multi-port Link component with explicit rates (efficiency equivalent to the Link) at each bus, including `bus0`. The component allows to flexibly change the reference unit used for associated costs by adjusting the rates. (<!-- md:pr 1333 -->)
+
+- Add weighted-time delays for Link outputs via new attributes `delay` and `cyclic_delay` (auto-expanded as `delay2`, `delay3`, ... and `cyclic_delay2`, `cyclic_delay3`, ... for additional ports). Delay is interpreted in units of `snapshot_weightings.generators`, with cyclic or non-cyclic boundary behavior. For the Process component the corresponding attributes have explicit numbering (`delay0`, `delay1`, `delay2`, ... and `cyclic_delay0`, `cyclic_delay1`). (<!-- md:pr 1569 -->)
+
+- New parameter `meshed_thresholds` in `n.optimize` for controlling groups of buses in nodal-balance constraints. Use this to save memory in the optimization definition for large networks with many interconnected buses. (<!-- md:pr 1591 -->)
+
+### Deprecations
+
+- Deprecate `pypsa.optimization.common.get_strongly_meshed_buses` in favor of `get_bus_counts`. The old `meshed_threshold` model kwarg is deprecated; use `meshed_thresholds=[...]` in [`n.optimize.create_model()`][pypsa.optimization.OptimizationAccessor.create_model] or [`n.optimize()`][pypsa.optimization.OptimizationAccessor.__call__].
+
+### Documentation
+- Add a `groupby` argument to statistics map plotting, allowing custom bus grouping (defaults to `['bus', 'carrier']`). (<!-- md:pr 1592 -->)
+
+### Bug Fixes
+
+
+- Fix call to `DataFrame/Series.groupby()` in pandas 3.0, dropping the `axis` argument (<!-- md:pr 1596 -->)
+
+- Fix ordering of additional port columns (`bus2`, `bus3`, `efficiency2`, etc.) in multi-port component defaults ÔÇö they now appear right after their base attribute instead of at the end.
+
+- Fixed typo "terminantion_condition" -> "termination_condition" in dictionary returned by `optimize_and_run_non_linear_powerflow` (<!-- md:pr 1333 -->)
+
+- Fixed output of `n.controllable_branches()` to include controllable branches instead of passive branches. (<!-- md:pr 1578 -->)
+
+- Fix `expand_series` losing index name on the resulting DataFrame with pandas >= 3.0, which caused xarray alignment errors in multi-investment period optimization. (<!-- md:pr 1581 -->)
+
+- Fix transmission flows not being displayed on energy balance map plots when `bus_carrier` is specified. The map plot now explicitly requests `at_port=0`, avoiding cancellation from summing both ports. (<!-- md:pr 1592 -->)
+
+### Documentation
+
+- New example notebook modeling oligopolistic behavior in energy markets using Cournot-Nash equilibrium with the fictitious objective approach. See [:material-notebook-multiple: notebook](./examples/imperfect-competition.ipynb).
+
+## [**v1.1.2**](https://github.com/PyPSA/PyPSA/releases/tag/v1.1.2) <small>23rd February 2026</small> { id="v1.1.2" }
+
+### Bug Fixes
+
+- Fix inconsistent `at_port` handling in statistics functions. The parameter now accepts integer port numbers and `"all"` with proper port resolution via component methods. Passing `True`/`False` is deprecated. (<!-- md:pr 1386 -->)
+
+- Fix `log_to_console` option breaking solvers that don't support it (e.g. CPLEX). The option is now only passed to the solver when explicitly set. (<!-- md:pr 1574 -->)
+
+- Fix release pipeline branch detection picking the wrong branch when multiple branches contain the tagged commit. (<!-- md:pr 1577 -->)
+
+## ~~v1.1.1~~ <small>23rd February 2026</small> { id="v1.1.1" }
+
+Yanked due to incorrect release from CI pipeline. Use v1.1.2 instead.
+
+## [**v1.1.0**](https://github.com/PyPSA/PyPSA/releases/tag/v1.1.0) <small>17th February 2026</small> { id="v1.1.0" }
+
+### Features
+
+- Enhanced statistics plotting for stochastic networks and network collections (<!-- md:pr 1401 -->):
+    - Interactive bar plots ([`iplot.bar`][pypsa.plot.StatisticPlotter.bar]) aggregate scenarios with standard deviation error bars
+    - Improved multi-level index handling with automatic grouping/faceting
+
+- Add secant-based transmission loss approximation (see <!-- md:guide optimization/power-flow.md -->). Use `transmission_losses=True` or pass a dict with mode and options, e.g. `transmission_losses={"mode": "secants", "atol": 1, "rtol": 0.1}`. Current tangent-based transmission loss approximation will stay as is, but needs to be chosen explicitly from version 2.0 (e.g. pass `transmission_losses={"mode": "tangents", "segments": 3}` instead of `transmission_losses=3`).
+
+- Add temporal clustering functionality via `n.cluster.temporal.*` accessor. (<!-- md:pr 1508 -->)
+
+    - `resample(offset)` - Aggregate snapshots at regular intervals (e.g., "3h", "24h")
+    - `downsample(stride)` - Select every Nth snapshot as representative
+    - `segment(num_segments)` - TSAM agglomerative clustering for variable-duration segments
+    - `from_snapshot_map(snapshot_map)` - Apply pre-computed temporal aggregation
+
+- New network sanitization and data integrity features (<!-- md:pr 1401 -->):
+    - [`n.sanitize()`][pypsa.Network.sanitize]: Run the following methods to fix consistency issues.
+        - [`n.components.buses.add_missing_buses()`][pypsa.components.Buses.add_missing_buses]: Add buses referenced by components but not yet defined.
+        - [`n.components.carriers.add_missing_carriers()`][pypsa.components.Carriers.add_missing_carriers]: Add carriers used by components but not yet defined.
+        - [`n.components.carriers.assign_colors()`][pypsa.components.Carriers.assign_colors]: Assign colors to carriers using matplotlib palettes.
+        - [`c.unique_carriers`][pypsa.Components.unique_carriers]: Get all unique carrier values for a component.
+
+- Add environment variable support for options via `PYPSA_*` prefix (e.g., `PYPSA_PARAMS__OPTIMIZE__SOLVER_NAME=gurobi`). (<!-- md:pr 1513 -->)
+
+- Add `n.nyears` property to get total modeled years based on snapshot weightings. (<!-- md:pr 1508 -->)
+
+- Add support for `p_set` time series in `StorageUnit` optimization. When specified, `p_set` now constrains the net power output (`p_dispatch - p_store`) to the given values, consistent with how `p_set` works for other components. (<!-- md:pr 1549 -->)
+
+- In version 2.0, capital costs of existing capacity on extendable assets will no longer be included in the objective by default (`n.objective_constant` will be set to zero), which improves LP numerical conditioning. A new `include_objective_constant` parameter was added to [`n.optimize()`][pypsa.optimization.OptimizationAccessor.__call__] and [`n.optimize.create_model()`][pypsa.optimization.OptimizationAccessor.create_model] to allow controlling this behavior and opt-in to the new default. It can also be configured via `pypsa.options.params.optimize.include_objective_constant` (see <!-- md:guide options.md -->). (<!-- md:pr 1509 -->)
+
+- Add `p_init` attribute to generators and links. This specifies the initial active power for ramp limit constraints at the first snapshot, enabling ramp constraints to be applied from the very start of an optimization horizon. (<!-- md:pr 1553 -->)
+
+- Allow filtering by carrier nice names in statistics methods. When `nice_names=True`, the `bus_carrier` and `carrier` parameters now accept nice names in addition to carrier names. (<!-- md:pr 1565 -->)
+
+- Add support for pandas 3.0, while maintaining compatibility with pandas 2.x. (<!-- md:pr 1556 -->)
+
+- Components can now be both committable and extendable simultaneously. This enables unit commitment with capacity expansion optimization using a big-M formulation that maintains the linear programming structure.
+
+- Components can now be committable and extendable together with modular capacity expansion. This enables unit commitment on single capacity modules within on asset. The formulation is compatible with start-up and shut-down costs, ramp-up and shut-down limit. The feature is not still compatible with min-up and min-down time, up and down time before.
+
+
+### Bug Fixes
+
+- **Breaking**: Fix `ramp_limit_start_up` and `ramp_limit_shut_down` being ignored in the very first snapshot in binary unit commitment. The constraints are now properly applied when these attributes are explicitly set. (<!-- md:pr 1553 -->)
+    - Changed default values of these attributes from `1` to `NaN` to align with `ramp_limit_up` and `ramp_limit_down` defaults and avoiding redundant constraints in the model instance. This allows distinguishing between "no limit" (NaN) and "full ramp allowed" (1). Code that relied on the implicit default of 1 may need updating.
+    - Ramp limit constraint names simplified from `{c}-fix-p-ramp_limit_*`, `{c}-ext-p-ramp_limit_*`, `{c}-com-p-ramp_limit_*` to unified `{c}-p-ramp_limit_*` (where `{c}` is `Generator` or `Link`).
+- Fix ramp limit constraints failing with mismatched index for multi-investment-period models with extendable or committable components. (<!-- md:pr 1537 -->)
+- Fix statistics methods raising an error when called with `groupby_time=True`. (<!-- md:pr 1538 -->)
+- Fix spatial clustering filling empty time series with defaults for `aggregate_one_ports`. (<!-- md:pr 1528 -->)
+- Fix link-port attribute expansion (`bus2`, `bus3`, `efficiency2`, ...) mutating shared Link defaults across networks. Additional Link ports are now updated only locally per network instance.
+
+### Documentation
+
+- New example notebooks:
+    - Demonstrating negative electricity prices in linearized unit commitment problem. See [:material-notebook-multiple: notebook](./examples/unit-commitment.ipynb). (<!-- md:pr 1434 -->)
+    - Combining PyPSA with Global Sensitivity Analysis (GSA) methods. See [:material-notebook-multiple: notebook](./examples/gsa.ipynb). (<!-- md:pr 1318 -->)
+
+- Add internal constraint and global constraint functions to the API reference (see <!-- md:api networks/constraints.md -->). (<!-- md:pr 1495 -->)
+
+
+## [**v1.0.7**](https://github.com/PyPSA/PyPSA/releases/tag/v1.0.7) <small>13th January 2026</small> { id="v1.0.7" }
+
+### Enhancements
+
+- Add support for Python 3.14. Note that not all optional dependencies and solvers
+  are available for Python 3.14 yet. (<!-- md:pr 1511 -->)
+- Add support for splitting `capital_cost` into overnight investment cost and fixed O&M (see <!-- md:guide optimization/objective.md -->). New component attributes `overnight_cost`, `discount_rate`, and `fom_cost` allow specifying overnight costs that are automatically annuitized during optimization. When `overnight_cost` is provided, PyPSA calculates the annuity using `discount_rate` and `lifetime` (supports 0% rate for simple depreciation). When `overnight_cost` is not set (default NaN), `capital_cost` is used. New [`pypsa.costs`][pypsa.costs] module with [`annuity()`][pypsa.costs.annuity] and [`periodized_cost()`][pypsa.costs.periodized_cost] functions. New statistics methods [`n.statistics.overnight_cost()`][pypsa.statistics.StatisticsAccessor.overnight_cost] and [`n.statistics.fom()`][pypsa.statistics.StatisticsAccessor.fom] for reporting. (<!-- md:pr 1507 -->)
+- Speed up creating the model by avoiding some redundant checks. (<!-- md:pr 1515 -->)
+
+
+### Bug Fixes
+
+- Fix `pypsa.common.annuity` function to correctly handle discount rate of 0. (<!-- md:pr 1512 -->)
+- Fix NetCDF export corrupting dynamic attributes when DataFrames are directly assigned without proper column names. (<!-- md:pr 1522 -->)
+
+## [**v1.0.6**](https://github.com/PyPSA/PyPSA/releases/tag/v1.0.6) <small>22nd December 2025</small> { id="v1.0.6" }
+
+### Enhancements
+
+- Add [`n.stats`][pypsa.Network.stats] as a shorthand alias for the [`n.statistics`][pypsa.Network.statistics] accessor. Users can now use `n.stats` interchangeably with `n.statistics`. (<!-- md:pr 1448 -->)
+- Enable modular expansion option in stochastic optimization problems. (<!-- md:pr 1500 -->)
+
+### Bug Fixes
+
+- Fix issue when assigning duals back to stochastic networks with global constraints. (<!-- md:pr 1498 -->)
+- Fix incorrect application of ramp limit constraints to fixed components without defined ramp limits. (<!-- md:pr 1494 -->)
+- Fix rolling horizon optimization with linearized unit commitment and ramp limits. (<!-- md:pr 1489 -->)
+- Fix `apply_transformer_types` failing in stochastic optimization due to types broadcasting. (<!-- md:pr 1499 -->)
 
 ## [**v1.0.5**](https://github.com/PyPSA/PyPSA/releases/tag/v1.0.5) <small>4th December 2025</small> { id="v1.0.5" }
 
@@ -33,10 +171,6 @@ SPDX-License-Identifier: CC-BY-4.0
 - Fix busmap clustering to correctly remap all bus ports in multi-port links. (<!-- md:pr 1441 -->)
 - Fix handling of inactive `StorageUnit` or `Store` components (<!-- md:pr 1442 -->)
 - Fix snapshot selection in operational limit global constraint with investment period. (<!-- md:pr 1437 -->)
-
-### Documentation
-
-- Added new example notebook demonstrating negative electricity prices in linearized unit commitment problem. (<!-- md:pr 1434 -->)
 
 ## [**v1.0.3**](https://github.com/PyPSA/PyPSA/releases/tag/v1.0.3) <small>6th November 2025</small> { id="v1.0.3" }
 
@@ -60,7 +194,7 @@ SPDX-License-Identifier: CC-BY-4.0
 
 - Fix dimension name consistency when adding investment period weightings. (<!-- md:pr 1416 -->)
 
-## [**v1.0.0**](https://github.com/PyPSA/PyPSA/releases/tag/v1.0.0) <small>14th October 2025</small> 🎉 { id="v1.0.0" }
+## [**v1.0.0**](https://github.com/PyPSA/PyPSA/releases/tag/v1.0.0) <small>14th October 2025</small> ­ƒÄë { id="v1.0.0" }
 
 ### **PyPSA 1.0** is here!
 
@@ -153,13 +287,13 @@ Check out [What's new in PyPSA v1.0](v1-guide.md).
   to get the previous behavior of returning component names which have been added.
   (<!-- md:pr 1347 -->)
 
-- Refactored version attributes: `__version_semver__` → `__version_base__`,
-  `__version_short__` → `__version_major_minor__`. Removed tuple versions.
+- Refactored version attributes: `__version_semver__` ÔåÆ `__version_base__`,
+  `__version_short__` ÔåÆ `__version_major_minor__`. Removed tuple versions.
   Old names raise `DeprecationWarning`. (<!-- md:pr 1338 -->)
 
 - Refined statistic arguments across optimization expressions and plotting modules.
-  Renamed `comps` → `components`, `aggregate_groups` → `groupby_method`,
-  and `aggregate_time` → `groupby_time` for consistency. Old argument names
+  Renamed `comps` ÔåÆ `components`, `aggregate_groups` ÔåÆ `groupby_method`,
+  and `aggregate_time` ÔåÆ `groupby_time` for consistency. Old argument names
   are deprecated and will be removed in v2.0.0. (<!-- md:pr 1358 -->)
 
 - Improve performance of loading networks by avoiding re-ordering dataframe columns
@@ -1820,7 +1954,7 @@ This release contains new improvements and bug fixes.
 * Various other minor fixes.
 
 We thank colleagues at TERI for assisting with testing the new unit
-commitment code, Clara Büttner for finding the SCLOPF bug, and all
+commitment code, Clara B├╝ttner for finding the SCLOPF bug, and all
 others who contributed issues and pull requests.
 
 
@@ -2016,8 +2150,8 @@ This release contains new features and bug fixes.
 * Bug fix: The storage unit spillage had a bug in the LOPF, whereby it
   was not respecting ``network.snapshot_weightings`` properly.
 
-We thank René Garcia Rosas, João Gorenstein Dedecca, Marko Kolenc,
-Matteo De Felice and Florian Kühnlenz for promptly notifying us about
+We thank Ren├® Garcia Rosas, Jo├úo Gorenstein Dedecca, Marko Kolenc,
+Matteo De Felice and Florian K├╝hnlenz for promptly notifying us about
 issues.
 
 
@@ -2147,7 +2281,7 @@ changes.
   parse snapshot dates as proper datetimes rather than text strings.
 
 
-João Gorenstein Dedecca has also implemented a MILP version of the
+Jo├úo Gorenstein Dedecca has also implemented a MILP version of the
 transmission expansion, see
 <https://github.com/jdedecca/MILP_PyPSA>, which properly takes
 account of the impedance with a disjunctive relaxation. This will be

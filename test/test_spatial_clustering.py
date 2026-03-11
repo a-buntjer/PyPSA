@@ -170,15 +170,32 @@ def test_cluster_accessor(scipy_network):
     prepare_network_for_aggregation(n)
 
     weighting = pd.Series(1, n.c.buses.static.index)
-    busmap = n.cluster.busmap_by_kmeans(
+    busmap = n.cluster.spatial.busmap_by_kmeans(
         bus_weightings=weighting, n_clusters=50, random_state=42
     )
-    buses = n.cluster.cluster_by_busmap(busmap).buses
+    buses = n.cluster.spatial.cluster_by_busmap(busmap).buses
 
-    buses_direct = n.cluster.cluster_spatially_by_kmeans(
+    buses_direct = n.cluster.spatial.cluster_by_kmeans(
         bus_weightings=weighting, n_clusters=50, random_state=42
     ).buses
     assert buses.equals(buses_direct)
+
+
+def test_cluster_accessor_deprecated(scipy_network):
+    n = scipy_network
+    prepare_network_for_aggregation(n)
+
+    weighting = pd.Series(1, n.c.buses.static.index)
+    with pytest.warns(DeprecationWarning, match="n.cluster.spatial"):
+        busmap = n.cluster.busmap_by_kmeans(
+            bus_weightings=weighting, n_clusters=50, random_state=42
+        )
+    with pytest.warns(DeprecationWarning, match="n.cluster.spatial"):
+        n.cluster.cluster_by_busmap(busmap)
+    with pytest.warns(DeprecationWarning, match="n.cluster.spatial"):
+        n.cluster.cluster_spatially_by_kmeans(
+            bus_weightings=weighting, n_clusters=50, random_state=42
+        )
 
 
 def test_custom_line_groupers(scipy_network):
@@ -248,3 +265,18 @@ def test_clustering_multiport_links():
 
     # Assert total number of buses is correct
     assert len(n.c.buses.static) == 3, f"Expected 3 buses, got {len(n.c.buses.static)}"
+
+
+def test_aggregate_one_ports_no_time_series():
+    """Test that empty time series stay empty after clustering."""
+    n = pypsa.Network()
+    n.set_snapshots(range(3))
+    n.add("Bus", ["a", "b"])
+    n.add("StorageUnit", "su", bus="a", p_nom=100)
+
+    assert n.storage_units_t.p.empty
+
+    busmap = pd.Series("x", n.buses.index)
+    C = get_clustering_from_busmap(n, busmap, aggregate_one_ports=["StorageUnit"])
+
+    assert C.n.storage_units_t.p.empty
